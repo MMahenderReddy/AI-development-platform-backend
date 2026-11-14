@@ -1,0 +1,146 @@
+version: "3.9"
+
+services:
+
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+
+  mongo:
+    image: mongo:7
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: orchestrator_db
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── Orchestrator API ────────────────────────────────────────────────────────
+
+  api:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    ports:
+      - "4564:4564"
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/orchestrator_db
+      REDIS_URL: redis://redis:6379
+      ORCHESTRATOR_WORKSPACE_DIR: /workspaces
+    volumes:
+      - workspaces:/workspaces
+      # Mount GitHub App private key (read-only)
+      - ${GITHUB_APP_PRIVATE_KEY_PATH:-/dev/null}:/run/secrets/github-app.pem:ro
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:4564/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── BullMQ Workers ──────────────────────────────────────────────────────────
+
+  worker-analysis:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    command: node src/workers/analysis.worker.js
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/orchestrator_db
+      REDIS_URL: redis://redis:6379
+      ORCHESTRATOR_WORKSPACE_DIR: /workspaces
+    volumes:
+      - workspaces:/workspaces
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-codegen:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    command: node src/workers/codegen.worker.js
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/orchestrator_db
+      REDIS_URL: redis://redis:6379
+      ORCHESTRATOR_WORKSPACE_DIR: /workspaces
+    volumes:
+      - workspaces:/workspaces
+      - ${GITHUB_APP_PRIVATE_KEY_PATH:-/dev/null}:/run/secrets/github-app.pem:ro
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-pms-sync:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    command: node src/workers/pmsSync.worker.js
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/orchestrator_db
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-pr-poll:
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    command: node src/workers/prPoll.worker.js
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      MONGODB_URI: mongodb://mongo:27017/orchestrator_db
+      REDIS_URL: redis://redis:6379
+      ORCHESTRATOR_WORKSPACE_DIR: /workspaces
+    volumes:
+      - workspaces:/workspaces
+      - ${GITHUB_APP_PRIVATE_KEY_PATH:-/dev/null}:/run/secrets/github-app.pem:ro
+    depends_on:
+      mongo:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  mongo_data:
+  redis_data:
+  workspaces:
