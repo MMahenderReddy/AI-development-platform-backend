@@ -22,6 +22,7 @@ import { githubClient } from "../lib/githubClient.js";
 import { pmsClient } from "../lib/pmsClient.js";
 import { cleanupClone } from "../lib/gitOps.js";
 import { audit } from "../lib/audit.js";
+import { getQueues } from "../lib/queues.js";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
 
@@ -126,6 +127,14 @@ const processor = async (bullJob) => {
       jobId: orcJob._id,
       details: { prNumber, repoFullName },
     });
+
+    // Fire deploy worker
+    const queues = getQueues();
+    await queues.deploy.add(
+      "run-deploy",
+      { jobId: String(orcJob._id) },
+      { jobId: `deploy:${orcJob._id}` },
+    ).catch((e) => console.warn("[pr-poll-worker] deploy enqueue warning:", e.message));
 
     return { merged: true, prNumber };
   }

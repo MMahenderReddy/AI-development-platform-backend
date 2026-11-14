@@ -75,6 +75,7 @@ const processor = async (bullJob) => {
         priority: task.priority ?? "medium",
         points: task.points ?? undefined,
         requirementIds: task.requirementIds ?? [],
+        taskArea: task.taskArea ?? "fullstack",
         status: "pending",
         repoFullName: orcJob.repoFullName,
       });

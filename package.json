@@ -8,8 +8,14 @@
     "start": "node src/server.js",
     "worker:analysis": "node --watch src/workers/analysis.worker.js",
     "worker:codegen": "node --watch src/workers/codegen.worker.js",
+    "worker:quality-gate": "node --watch src/workers/qualityGate.worker.js",
+    "worker:push": "node --watch src/workers/push.worker.js",
+    "worker:rework": "node --watch src/workers/rework.worker.js",
+    "worker:integration": "node --watch src/workers/integration.worker.js",
     "worker:pms-sync": "node --watch src/workers/pmsSync.worker.js",
-    "worker:pr-poll": "node --watch src/workers/prPoll.worker.js"
+    "worker:task-assignment": "node --watch src/workers/taskAssignment.worker.js",
+    "worker:pr-poll": "node --watch src/workers/prPoll.worker.js",
+    "worker:deploy": "node --watch src/workers/deploy.worker.js"
   },
   "dependencies": {
     "@bull-board/api": "^9.13.1",

@@ -48,13 +48,26 @@ function topologicalSort(tasks) {
   return result;
 }
 
+const AREA_CAPABILITY_MAP = {
+  frontend:  ["frontend", "fullstack"],
+  backend:   ["backend", "fullstack"],
+  fullstack: ["fullstack", "lead"],
+};
+
 function pickMember(task, members) {
   if (members.length === 0) return null;
 
   const titleLower = task.title.toLowerCase();
   const typeLower = (task.type ?? "").toLowerCase();
+  const taskArea = task.taskArea ?? "fullstack";
 
-  const skilled = members.filter(
+  // 1. Prefer members whose capability matches the task area
+  const capabilityPool = members.filter(
+    (m) => (AREA_CAPABILITY_MAP[taskArea] ?? ["fullstack"]).includes(m.capability ?? "fullstack"),
+  );
+
+  // 2. Within capability pool, further narrow by skill keyword
+  const capSkilled = capabilityPool.filter(
     (m) =>
       m.skills?.some(
         (s) =>
@@ -63,7 +76,14 @@ function pickMember(task, members) {
       ),
   );
 
-  const pool = skilled.length > 0 ? skilled : members;
+  // 3. Fall back through progressively broader pools
+  const pool =
+    capSkilled.length > 0
+      ? capSkilled
+      : capabilityPool.length > 0
+      ? capabilityPool
+      : members;
+
   return pool.reduce((best, m) =>
     (m.activeTaskCount ?? 0) < (best.activeTaskCount ?? 0) ? m : best,
   );

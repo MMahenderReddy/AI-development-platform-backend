@@ -137,6 +137,7 @@ router.post("/:id/tasks/approve", requireAuth, requireRole("admin", "manager", "
         priority: t.priority,
         points,
         requirementIds: Array.isArray(t.requirementIds) ? t.requirementIds.slice(0, 20) : [],
+        assigneeId: t.assigneeId ?? null,
       };
     });
 
@@ -168,7 +169,7 @@ router.post("/:id/tasks/approve", requireAuth, requireRole("admin", "manager", "
         priority: t.priority ?? "medium",
         points: t.points ?? undefined,
         requirementIds: t.requirementIds ?? [],
-        status: "pending",
+        ...(t.assigneeId ? { assignedTo: t.assigneeId, status: "assigned" } : { status: "pending" }),
         repoFullName: job.repoFullName,
       }));
       await Task.insertMany(taskDocs);
@@ -224,22 +225,26 @@ router.post("/:id/start-codegen", requireAuth, requireRole("admin", "manager", "
     const pmsTaskId = req.body?.pmsTaskId ?? job.pmsTaskIds?.[0];
     if (!pmsTaskId) throw badRequest("No pmsTaskId provided and no PMS tasks on this job");
 
-    // Verify the PMS task still exists
-    try {
-      await pmsClient.getTask(pmsTaskId);
-    } catch (err) {
-      throw badRequest(`PMS task ${pmsTaskId} not found: ${err.message}`);
+    // For standalone tasks, skip PMS verification; for PMS tasks, verify they still exist
+    const isStandalone = String(pmsTaskId).startsWith("standalone-");
+    if (!isStandalone) {
+      try {
+        await pmsClient.getTask(pmsTaskId);
+      } catch (err) {
+        throw badRequest(`PMS task ${pmsTaskId} not found: ${err.message}`);
+      }
     }
 
     job.status = "generating";
     job.stage = 6;
     await job.save();
 
-    // Mark Task as generating (best-effort — may not exist on legacy jobs)
-    await Task.findOneAndUpdate(
-      { jobId: job._id, pmsTaskId },
-      { status: "generating" },
-    );
+    // Apply manual assignee if provided, then mark task as generating
+    const taskUpdate = { status: "generating" };
+    if (req.body?.assigneeId) {
+      taskUpdate.assignedTo = req.body.assigneeId;
+    }
+    await Task.findOneAndUpdate({ jobId: job._id, pmsTaskId }, taskUpdate);
 
     const queues = getQueues();
     await queues.codegen.add(
@@ -248,7 +253,7 @@ router.post("/:id/start-codegen", requireAuth, requireRole("admin", "manager", "
       { jobId: `codegen:${job._id}:${pmsTaskId}` },
     );
 
-    audit(req.user, "codegen.started", { jobId: job._id, details: { pmsTaskId } });
+    audit(req.user, "codegen.started", { jobId: job._id, details: { pmsTaskId, assigneeId: req.body?.assigneeId } });
 
     res.json({ status: job.status, stage: job.stage, pmsTaskId });
   } catch (err) {

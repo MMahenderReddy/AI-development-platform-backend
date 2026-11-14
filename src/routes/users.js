@@ -15,6 +15,7 @@ import { audit } from "../lib/audit.js";
 const router = Router();
 
 const ROLES = ["admin", "manager", "lead", "viewer"];
+const CAPABILITIES = ["frontend", "backend", "fullstack", "lead"];
 
 // ── List members ──────────────────────────────────────────────────────────────
 router.get("/", requireAuth, requireRole("admin", "manager"), async (req, res, next) => {
@@ -32,14 +33,19 @@ router.get("/", requireAuth, requireRole("admin", "manager"), async (req, res, n
 // ── Invite (create) a new member ──────────────────────────────────────────────
 router.post("/invite", requireAuth, requireRole("admin"), async (req, res, next) => {
   try {
-    const { name, email, password, role, pmsUserId } = req.body ?? {};
+    const { name, email, password, role, capability, pmsUserId, skills } = req.body ?? {};
     if (!name?.trim()) throw badRequest("Name is required");
     if (!email?.trim()) throw badRequest("Email is required");
     if (!password || password.length < 8) throw badRequest("Password must be at least 8 characters");
     if (role && !ROLES.includes(role)) throw badRequest(`Role must be one of: ${ROLES.join(", ")}`);
+    if (capability && !CAPABILITIES.includes(capability)) throw badRequest(`Capability must be one of: ${CAPABILITIES.join(", ")}`);
 
     const existing = await OrchestratorUser.findOne({ email: String(email).toLowerCase() });
     if (existing) throw badRequest("A user with that email already exists");
+
+    const skillsArr = Array.isArray(skills)
+      ? skills.map((s) => String(s).trim()).filter(Boolean).slice(0, 30)
+      : [];
 
     const passwordHash = await OrchestratorUser.hashPassword(String(password));
     const user = await OrchestratorUser.create({
@@ -47,7 +53,9 @@ router.post("/invite", requireAuth, requireRole("admin"), async (req, res, next)
       email: String(email).toLowerCase().trim(),
       passwordHash,
       role: role ?? "viewer",
+      capability: capability ?? "fullstack",
       pmsUserId: pmsUserId ?? "",
+      skills: skillsArr,
       status: "active",
     });
 
@@ -56,11 +64,13 @@ router.post("/invite", requireAuth, requireRole("admin"), async (req, res, next)
     });
 
     res.status(201).json({
-      id: user._id,
+      _id: user._id,
       name: user.name,
       email: user.email,
       role: user.role,
+      capability: user.capability,
       pmsUserId: user.pmsUserId,
+      skills: user.skills,
       status: user.status,
       createdAt: user.createdAt,
     });
@@ -143,6 +153,29 @@ router.patch("/:id/skills", requireAuth, async (req, res, next) => {
 
     audit(req.user, "users.skills_updated", {
       details: { targetEmail: user.email, skills },
+    });
+
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Update capability ─────────────────────────────────────────────────────────
+router.patch("/:id/capability", requireAuth, requireRole("admin"), async (req, res, next) => {
+  try {
+    const { capability } = req.body ?? {};
+    if (!CAPABILITIES.includes(capability)) throw badRequest(`Capability must be one of: ${CAPABILITIES.join(", ")}`);
+
+    const user = await OrchestratorUser.findByIdAndUpdate(
+      req.params.id,
+      { capability },
+      { new: true, select: "-passwordHash" }
+    );
+    if (!user) throw notFound("User");
+
+    audit(req.user, "users.capability_changed", {
+      details: { targetEmail: user.email, capability },
     });
 
     res.json(user);

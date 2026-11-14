@@ -162,6 +162,11 @@ const GENERATE_TASKS_TOOL = {
                 items: { type: "string" },
                 description: "IDs of the requirements this task addresses (e.g. ['REQ-001', 'REQ-002'])",
               },
+              taskArea: {
+                type: "string",
+                enum: ["frontend", "backend", "fullstack"],
+                description: "Which part of the codebase this task belongs to: frontend (UI/UX), backend (API/server/DB), or fullstack (both)",
+              },
             },
           },
         },
@@ -280,6 +285,7 @@ Rules:
 - Each task must map to one or more requirements
 - Task titles must be under 140 characters and start with an imperative verb (Add, Fix, Build, Update, etc.)
 - Story points follow Fibonacci: 1, 2, 3, 5, 8, 13
+- Classify each task as frontend (UI components, styling, routes), backend (API, database, server logic), or fullstack (requires both)
 - Respond exclusively by calling save_tasks — no other output`;
 
 /**

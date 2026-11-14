@@ -78,12 +78,15 @@ const processor = async (bullJob) => {
   // ── Step 1: Load orchestrator job + Task document ────────────────────────
   const orcJob = await Job.findById(jobId);
   if (!orcJob) throw new Error(`Job ${jobId} not found`);
-  if (!orcJob.repoFullName) throw new Error("Job has no repoFullName");
 
   // Find the Task document (best-effort — may not exist on legacy jobs)
   const taskDoc = pmsTaskId
     ? await Task.findOne({ jobId, pmsTaskId })
     : null;
+
+  // Use per-task repoFullName if set (multi-repo routing), fall back to job's
+  const repoFullName = taskDoc?.repoFullName || orcJob.repoFullName;
+  if (!repoFullName) throw new Error("No repoFullName on task or job");
 
   if (taskDoc) {
     taskDoc.status = "generating";
@@ -121,12 +124,12 @@ const processor = async (bullJob) => {
   }
 
   // ── Step 4: Clone repo ────────────────────────────────────────────────────
-  console.log(`[codegen-worker] cloning ${orcJob.repoFullName} → ${cloneDir}`);
+  console.log(`[codegen-worker] cloning ${repoFullName} → ${cloneDir}`);
   let git;
   try {
-    git = await cloneRepo(orcJob.repoFullName, cloneDir);
+    git = await cloneRepo(repoFullName, cloneDir);
   } catch (err) {
-    throw new Error(`Clone failed for ${orcJob.repoFullName}: ${err.message}`);
+    throw new Error(`Clone failed for ${repoFullName}: ${err.message}`);
   }
 
   await bullJob.updateProgress(20);
@@ -301,7 +304,7 @@ const processor = async (bullJob) => {
     taskDoc.branchName = branchName;
     taskDoc.clonePath = cloneDir;
     taskDoc.diffSummary = finalDiffSummary;
-    taskDoc.repoFullName = orcJob.repoFullName;
+    taskDoc.repoFullName = repoFullName;
     taskDoc.lastHeartbeatAt = new Date();
     await taskDoc.save();
   }
@@ -327,10 +330,13 @@ const processor = async (bullJob) => {
     );
     console.log(`[codegen-worker] enqueued quality-gate for task=${taskDoc._id}`);
   } else {
-    // Legacy job with no Task document — skip quality gate, advance directly
-    orcJob.status = "awaiting_diff_approval";
-    orcJob.stage = 7;
-    await orcJob.save();
+    // Legacy job with no Task document — skip quality gate, enqueue push directly
+    const queues = getQueues();
+    await queues.push.add(
+      "push-branch",
+      { jobId: String(orcJob._id), taskId: null },
+      { jobId: `push:${orcJob._id}:legacy` },
+    );
   }
 
   await bullJob.updateProgress(100);

@@ -11,6 +11,8 @@ const userSchema = new Schema(
     status: { type: String, enum: ["active", "disabled"], default: "active" },
     skills: [String],
     activeTaskCount: { type: Number, default: 0, min: 0 },
+    capability: { type: String, enum: ["frontend", "backend", "fullstack", "lead"], default: "fullstack" },
+    isAiAgent: { type: Boolean, default: false },
   },
   { timestamps: true },
 );

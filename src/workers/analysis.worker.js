@@ -1,5 +1,5 @@
 /**
- * Analysis Worker — Phase 2
+ * Analysis Worker — Autonomous Pipeline
  *
  * Job data: { jobId: string, documentId: string }
  *
@@ -9,7 +9,12 @@
  *  3. If text > 500 KB, split into chunks
  *  4. Call OpenAI with function calling to extract requirements from each chunk
  *  5. Merge, deduplicate, and renumber requirements
- *  6. Save requirements to Document; update Job status → awaiting_requirements_approval
+ *  6. Auto-approve all requirements, then immediately enqueue generate-tasks
+ *     (no human approval gate — fully autonomous)
+ *
+ * generate-tasks processor:
+ *  Generates PMS tasks from approved requirements with taskArea classification,
+ *  then immediately enqueues pms-sync (no human approval gate).
  */
 import { Worker } from "bullmq";
 import { getRedis } from "../lib/redis.js";
@@ -19,6 +24,7 @@ import { extractRequirementsFromChunk, generateTasksFromRequirements } from "../
 import { audit } from "../lib/audit.js";
 import Job from "../models/Job.js";
 import Document from "../models/Document.js";
+import { getQueues } from "../lib/queues.js";
 import config from "../config/env.js";
 
 await connectDb();
@@ -41,17 +47,28 @@ const generateTasksProcessor = async (bullJob) => {
   const aiTasks = await generateTasksFromRequirements(approvedReqs);
   await bullJob.updateProgress(80);
 
-  // Store the AI-generated task suggestions on the job document
-  // (AiTask model is minimal — it's reviewed and edited before PMS creation)
   orcJob.set("aiGeneratedTasks", aiTasks);
-  orcJob.status = "awaiting_task_approval"; // human review gate
-  orcJob.stage = 3; // still Stage 3 — user must review
+  orcJob.status = "syncing_to_pms";
+  orcJob.stage = 4;
   await orcJob.save();
 
   audit("system", "tasks.generated", {
     jobId: orcJob._id,
     details: { taskCount: aiTasks.length },
   });
+
+  // Auto-fire pms-sync immediately — no human approval gate
+  const queues = getQueues();
+  await queues.pmsSync.add(
+    "create-tasks",
+    {
+      jobId: String(orcJob._id),
+      pmsProjectId: orcJob.pmsProjectId,
+      tasks: aiTasks,
+    },
+    { jobId: `pmssync:${orcJob._id}` },
+  );
+  console.log(`[analysis-worker] enqueued pms-sync for job=${jobId} (${aiTasks.length} tasks)`);
 
   await bullJob.updateProgress(100);
   return { taskCount: aiTasks.length };
@@ -127,13 +144,14 @@ const processor = async (bullJob) => {
     rejected: false,
   }));
 
-  // ── Step 4: Save to database ──────────────────────────────────────────────
+  // ── Step 4: Auto-approve all requirements and advance ────────────────────
   await bullJob.updateProgress(90);
-  doc.requirements = requirements;
+  // Mark all requirements approved — no human gate
+  doc.requirements = requirements.map((r) => ({ ...r, approved: true }));
   await doc.save();
 
-  orcJob.status = "awaiting_requirements_approval";
-  orcJob.stage = 2;
+  orcJob.status = "generating_tasks";
+  orcJob.stage = 3;
   orcJob.aiModel = config.openai.model;
   await orcJob.save();
 
@@ -142,8 +160,17 @@ const processor = async (bullJob) => {
     details: { requirementsCount: requirements.length, chunked: doc.chunked },
   });
 
+  // Immediately enqueue task generation — no human approval gate
+  const queues = getQueues();
+  await queues.analysis.add(
+    "generate-tasks",
+    { jobId: String(orcJob._id), documentId: String(doc._id) },
+    { jobId: `gentasks:${orcJob._id}` },
+  );
+  console.log(`[analysis-worker] enqueued generate-tasks for job=${jobId}`);
+
   await bullJob.updateProgress(100);
-  console.log(`[analysis-worker] done job=${jobId}, ${requirements.length} requirements extracted`);
+  console.log(`[analysis-worker] done job=${jobId}, ${requirements.length} requirements auto-approved`);
   return { requirementsCount: requirements.length };
 };
 

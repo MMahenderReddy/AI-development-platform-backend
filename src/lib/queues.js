@@ -41,6 +41,22 @@ export const getQueues = () => {
       connection,
       defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 2, backoff: { type: "fixed", delay: 5_000 } },
     }),
+    push: new Queue("push", {
+      connection,
+      defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 3, backoff: { type: "exponential", delay: 15_000 } },
+    }),
+    integration: new Queue("integration", {
+      connection,
+      defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 3, backoff: { type: "exponential", delay: 60_000 } },
+    }),
+    rework: new Queue("rework", {
+      connection,
+      defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 2, backoff: { type: "fixed", delay: 5_000 } },
+    }),
+    deploy: new Queue("deploy", {
+      connection,
+      defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 3, backoff: { type: "exponential", delay: 60_000 } },
+    }),
   };
   return _queues;
 };

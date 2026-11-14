@@ -30,6 +30,7 @@ import { connectDb } from "../lib/db.js";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
 import { audit } from "../lib/audit.js";
+import { getQueues } from "../lib/queues.js";
 import config from "../config/env.js";
 
 const execAsync = promisify(exec);
@@ -45,28 +46,6 @@ async function heartbeat(jobId, taskId) {
 const PASS_QG_STATUSES = new Set([
   "awaiting_diff", "awaiting_push", "pushed", "pr_open", "merged",
 ]);
-
-/** Advance job to awaiting_diff_approval if all tasks have cleared the quality gate. */
-async function advanceJobIfReady(jobId) {
-  const all = await Task.find({ jobId }).lean();
-  if (all.length === 0) return false;
-
-  const blocking = all.filter(
-    (t) => !PASS_QG_STATUSES.has(t.status) && t.status !== "failed" && t.status !== "cancelled",
-  );
-  if (blocking.length > 0) return false;
-
-  // At least one task must be awaiting_diff
-  const ready = all.filter((t) => t.status === "awaiting_diff");
-  if (ready.length === 0) return false;
-
-  await Job.findByIdAndUpdate(jobId, {
-    status: "awaiting_diff_approval",
-    stage: 7,
-    $unset: { errorMessage: 1 },
-  });
-  return true;
-}
 
 /** Run a single npm script inside the clone dir with a timeout. Returns { passed, output }. */
 async function runCheck(script, cloneDir, timeoutMs) {
@@ -184,45 +163,60 @@ const processor = async (bullJob) => {
   const failed = checks.filter((c) => !c.passed);
   const qualityOutput = outputs.join("\n\n").slice(0, 16000);
 
+  const queues = getQueues();
+
   if (failed.length === 0) {
-    // All checks passed (or were skipped)
+    // All checks passed — auto-enqueue push worker (no human diff-approval gate)
     await Task.findByIdAndUpdate(taskId, {
-      status: "awaiting_diff",
+      status: "awaiting_push",
       qualityOutput,
       lastHeartbeatAt: new Date(),
     });
-
-    const advanced = await advanceJobIfReady(jobId);
-    console.log(
-      `[quality-gate-worker] task=${taskId} passed all checks; job advanced=${advanced}`,
-    );
 
     audit("system", "quality_gate.passed", {
       jobId: orcJob._id,
       details: { taskId, checks: checks.map((c) => c.name) },
     });
+
+    await queues.push.add(
+      "push-branch",
+      { jobId: String(orcJob._id), taskId: String(taskId) },
+      { jobId: `push:${orcJob._id}:${taskId}` },
+    );
+    console.log(`[quality-gate-worker] task=${taskId} passed — enqueued push`);
   } else {
-    // Quality gate blocked
+    // Quality gate failed — enqueue rework worker (no manual override required)
     const failedNames = failed.map((c) => c.name).join(", ");
     const errorMsg = `Quality gate failed: ${failedNames}. See quality output for details.`;
+    const retryCount = (task.retryCount ?? 0) + 1;
+    const maxRetries = Number(process.env.REWORK_MAX_RETRIES ?? 3);
 
     await Task.findByIdAndUpdate(taskId, {
       status: "quality_failed",
       qualityOutput,
       errorMessage: errorMsg,
-    });
-
-    await Job.findByIdAndUpdate(jobId, {
-      status: "quality_failed",
-      errorMessage: errorMsg,
+      retryCount,
     });
 
     audit("system", "quality_gate.failed", {
       jobId: orcJob._id,
-      details: { taskId, failed: failedNames },
+      details: { taskId, failed: failedNames, retryCount },
     });
 
-    console.warn(`[quality-gate-worker] task=${taskId} BLOCKED — ${failedNames}`);
+    if (retryCount > maxRetries) {
+      await Job.findByIdAndUpdate(jobId, {
+        status: "quality_failed",
+        errorMessage: `Task ${taskId} exceeded max retries (${maxRetries}): ${errorMsg}`,
+      });
+      console.error(`[quality-gate-worker] task=${taskId} exceeded max retries — escalating`);
+    } else {
+      await queues.rework.add(
+        "create-rework",
+        { jobId: String(orcJob._id), taskId: String(taskId), reason: errorMsg, retryCount },
+        { jobId: `rework:${taskId}:${retryCount}` },
+      );
+      console.warn(`[quality-gate-worker] task=${taskId} FAILED (attempt ${retryCount}/${maxRetries}) — enqueued rework`);
+    }
   }
 
   await bullJob.updateProgress(100);

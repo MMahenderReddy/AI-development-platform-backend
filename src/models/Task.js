@@ -27,6 +27,12 @@ const taskSchema = new Schema(
     priority:      { type: String, enum: ["urgent", "high", "medium", "low"], default: "medium" },
     points:        Number,
     requirementIds: [String],
+    taskArea: { type: String, enum: ["frontend", "backend", "fullstack"], default: "fullstack" },
+
+    // rework lineage
+    parentTaskId: { type: Schema.Types.ObjectId, ref: "Task" },
+    reworkReason:  String,
+    retryCount:    { type: Number, default: 0 },
 
     // dependency graph — task starts only when all predecessors are merged
     dependsOn:     [{ type: Schema.Types.ObjectId, ref: "Task" }],

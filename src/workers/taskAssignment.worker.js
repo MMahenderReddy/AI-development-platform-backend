@@ -22,6 +22,8 @@ import { Worker } from "bullmq";
 import { getRedis } from "../lib/redis.js";
 import { connectDb } from "../lib/db.js";
 import Job from "../models/Job.js";
+import Task from "../models/Task.js";
+import RepoMapping from "../models/RepoMapping.js";
 import { scheduleTasks } from "../lib/scheduler.js";
 import { audit } from "../lib/audit.js";
 
@@ -47,6 +49,25 @@ const processor = async (bullJob) => {
   // Mark in-progress so the UI shows the auto-assigning state
   await Job.findByIdAndUpdate(jobId, { status: "auto_assigning" });
   await bullJob.updateProgress(10);
+
+  // Resolve per-task repoFullName from RepoMapping before scheduling
+  if (orcJob.pmsProjectId) {
+    const pendingTasks = await Task.find({ jobId: orcJob._id, status: "pending" });
+    const repoMappings = await RepoMapping.find({ pmsProjectId: orcJob.pmsProjectId }).lean();
+    const mappingByType = Object.fromEntries(repoMappings.map((m) => [m.repoType, m]));
+
+    for (const task of pendingTasks) {
+      const area = task.taskArea ?? "fullstack";
+      const mapping = mappingByType[area] ?? mappingByType["default"];
+      if (mapping) {
+        await Task.findByIdAndUpdate(task._id, {
+          repoFullName: mapping.repoFullName,
+          baseBranch: mapping.baseBranch ?? "main",
+        });
+      }
+    }
+  }
+  await bullJob.updateProgress(30);
 
   const result = await scheduleTasks(jobId);
   await bullJob.updateProgress(90);

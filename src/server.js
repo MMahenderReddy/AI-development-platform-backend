@@ -17,6 +17,8 @@ import bullBoardRouter from "./routes/bullBoard.js";
 import usersRouter from "./routes/users.js";
 import tasksRouter from "./routes/tasks.js";
 import repoMappingsRouter from "./routes/repoMappings.js";
+import projectsRouter from "./routes/projects.js";
+import integrationRunsRouter from "./routes/integrationRuns.js";
 import { apiLimiter, authLimiter, uploadLimiter, jobCreateLimiter } from "./middleware/rateLimit.js";
 import { ApiError } from "./lib/errors.js";
 import { runStartupRecovery } from "./lib/recoveryJob.js";
@@ -49,6 +51,8 @@ app.use("/api/pms", pmsRouter);
 app.use("/api/users", usersRouter);
 app.use("/api/tasks", tasksRouter);
 app.use("/api/repo-mappings", repoMappingsRouter);
+app.use("/api/projects", projectsRouter);
+app.use("/api/integration-runs", integrationRunsRouter);
 
 // ── Admin: Bull Board queue monitor ──────────────────────────────────────────
 app.use("/admin/queues", bullBoardRouter);
