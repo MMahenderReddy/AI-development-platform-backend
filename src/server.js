@@ -15,8 +15,11 @@ import approvalsRouter from "./routes/approvals.js";
 import pmsRouter from "./routes/pms.js";
 import bullBoardRouter from "./routes/bullBoard.js";
 import usersRouter from "./routes/users.js";
+import tasksRouter from "./routes/tasks.js";
+import repoMappingsRouter from "./routes/repoMappings.js";
 import { apiLimiter, authLimiter, uploadLimiter, jobCreateLimiter } from "./middleware/rateLimit.js";
 import { ApiError } from "./lib/errors.js";
+import { runStartupRecovery } from "./lib/recoveryJob.js";
 
 const app = express();
 
@@ -44,6 +47,8 @@ app.use("/api/documents", documentsRouter);
 app.use("/api/approvals", approvalsRouter);
 app.use("/api/pms", pmsRouter);
 app.use("/api/users", usersRouter);
+app.use("/api/tasks", tasksRouter);
+app.use("/api/repo-mappings", repoMappingsRouter);
 
 // ── Admin: Bull Board queue monitor ──────────────────────────────────────────
 app.use("/admin/queues", bullBoardRouter);
@@ -62,6 +67,12 @@ app.use((err, req, res, _next) => {
 const start = async () => {
   await connectDb();
   getRedis(); // initialize connection
+
+  try {
+    await runStartupRecovery();
+  } catch (err) {
+    console.warn("[server] startup recovery failed (non-fatal):", err.message);
+  }
 
   if (config.pms.serviceEmail && config.pms.servicePassword) {
     try {

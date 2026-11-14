@@ -258,7 +258,7 @@ export const generateCodeForTask = async (task, codebaseContext) => {
   const toolCall = response.choices[0]?.message?.tool_calls?.[0];
   if (!toolCall) {
     console.warn("[openai] no tool call returned from generateCodeForTask");
-    return { files: [], commitMessage: "" };
+    return { files: [], commitMessage: "", usage: response.usage ?? null };
   }
 
   try {
@@ -266,9 +266,10 @@ export const generateCodeForTask = async (task, codebaseContext) => {
     return {
       files: parsed.files ?? [],
       commitMessage: parsed.commitMessage ?? `feat: ${task.title.slice(0, 72)}`,
+      usage: response.usage ?? null,
     };
   } catch {
-    return { files: [], commitMessage: "" };
+    return { files: [], commitMessage: "", usage: response.usage ?? null };
   }
 };
 

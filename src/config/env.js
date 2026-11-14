@@ -63,4 +63,16 @@ export default {
     jobTimeoutMs: Number(optional("ORCHESTRATOR_JOB_TIMEOUT_MS", "600000")),
     workspaceDir: optional("ORCHESTRATOR_WORKSPACE_DIR", "./workspaces"),
   },
+
+  stagger: {
+    taskMs: Number(optional("TASK_STAGGER_MS", "30000")),
+    githubOpMs: Number(optional("GITHUB_OP_DELAY_MS", "10000")),
+  },
+
+  qualityGate: {
+    lint:       optional("QUALITY_GATE_LINT",  "true") === "true",
+    test:       optional("QUALITY_GATE_TEST",  "true") === "true",
+    build:      optional("QUALITY_GATE_BUILD", "true") === "true",
+    timeoutMs:  Number(optional("QUALITY_GATE_TIMEOUT_MS", "120000")),
+  },
 };

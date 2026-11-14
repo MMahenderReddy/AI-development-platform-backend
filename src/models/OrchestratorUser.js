@@ -9,6 +9,8 @@ const userSchema = new Schema(
     role: { type: String, enum: ["admin", "manager", "lead", "viewer"], default: "viewer" },
     pmsUserId: String,
     status: { type: String, enum: ["active", "disabled"], default: "active" },
+    skills: [String],
+    activeTaskCount: { type: Number, default: 0, min: 0 },
   },
   { timestamps: true },
 );

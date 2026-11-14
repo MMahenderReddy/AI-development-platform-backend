@@ -8,9 +8,11 @@ const JOB_STATUSES = [
   "awaiting_task_approval",
   "syncing_to_pms",
   "awaiting_assignment",
+  "auto_assigning",        // Phase 2: assignment worker running
   "generating",
   "awaiting_diff_approval",
   "quality_gate",
+  "quality_failed",        // quality gate failed; task-level override required
   "awaiting_push_approval",
   "pushed",
   "pr_open",
@@ -39,6 +41,8 @@ const jobSchema = new Schema(
     diffSummary: Schema.Types.Mixed,  // structured: { summary, filesChanged, additions, deletions, files }
     clonePath: String,                 // persistent clone dir for push step
     aiGeneratedTasks: [Schema.Types.Mixed],
+    mode: { type: String, enum: ["pms", "standalone"], default: "pms" },
+    lastHeartbeatAt: Date,
   },
   { timestamps: true },
 );

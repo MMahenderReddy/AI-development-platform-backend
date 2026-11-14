@@ -2,15 +2,17 @@ import { Router } from "express";
 import { existsSync } from "fs";
 import { simpleGit } from "simple-git";
 import Job from "../models/Job.js";
+import Task from "../models/Task.js";
 import Approval from "../models/Approval.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
-import { notFound, badRequest } from "../lib/errors.js";
+import { notFound, badRequest, conflict } from "../lib/errors.js";
 import { pmsClient } from "../lib/pmsClient.js";
 import config from "../config/env.js";
 import { githubClient } from "../lib/githubClient.js";
 import { pushBranch } from "../lib/gitOps.js";
 import { getQueues } from "../lib/queues.js";
 import { audit } from "../lib/audit.js";
+import { getJobCostSummary } from "../lib/costTracker.js";
 
 const TASK_TYPES = ["task", "bug", "feature", "improvement"];
 const PRIORITIES = ["urgent", "high", "medium", "low"];
@@ -43,20 +45,39 @@ router.get("/:id", requireAuth, async (req, res, next) => {
   }
 });
 
+const ACTIVE_JOB_STATUSES = [
+  "pending", "analyzing", "awaiting_requirements_approval", "generating_tasks",
+  "awaiting_task_approval", "syncing_to_pms", "awaiting_assignment", "auto_assigning",
+  "generating", "quality_gate", "quality_failed", "awaiting_diff_approval",
+  "awaiting_push_approval", "pushed", "pr_open",
+];
+
 router.post("/", requireAuth, requireRole("admin", "manager", "lead"), async (req, res, next) => {
   try {
-    const { pmsProjectId, repoFullName } = req.body ?? {};
+    const { pmsProjectId, repoFullName, mode } = req.body ?? {};
     if (!pmsProjectId) throw badRequest("pmsProjectId is required");
     if (!repoFullName) throw badRequest("repoFullName is required");
+    const jobMode = mode === "standalone" ? "standalone" : "pms";
 
-    // Verify the project exists in PMS (skip when PMS is not configured)
-    if (config.pms.serviceEmail && config.pms.servicePassword) {
+    // Duplicate job guard — prevent two active jobs for the same PMS project
+    const existing = await Job.findOne({ pmsProjectId, status: { $in: ACTIVE_JOB_STATUSES } }).lean();
+    if (existing) {
+      throw conflict(
+        `An active job already exists for project ${pmsProjectId} ` +
+        `(jobId: ${existing._id}, status: ${existing.status}). ` +
+        "Cancel or complete it before starting a new one.",
+      );
+    }
+
+    // Verify the project exists in PMS (skip for standalone or when PMS is not configured)
+    if (jobMode === "pms" && config.pms.serviceEmail && config.pms.servicePassword) {
       await pmsClient.getProject(pmsProjectId);
     }
 
     const job = await Job.create({
       pmsProjectId,
       repoFullName,
+      mode: jobMode,
       createdBy: req.user._id,
       status: "pending",
       stage: 1,
@@ -129,22 +150,52 @@ router.post("/:id/tasks/approve", requireAuth, requireRole("admin", "manager", "
       payload: { taskCount: tasks.length },
     });
 
-    // Advance status and enqueue PMS sync (Stage 4 — auto)
-    job.status = "syncing_to_pms";
-    job.stage = 4;
-    job.set("aiGeneratedTasks", tasks); // save the reviewed/edited list
-    await job.save();
+    job.set("aiGeneratedTasks", tasks);
 
-    const queues = getQueues();
-    await queues.pmsSync.add(
-      "create-tasks",
-      { jobId: String(job._id), pmsProjectId: job.pmsProjectId, tasks },
-      { jobId: `pmssync:${job._id}` },
-    );
+    if (job.mode === "standalone") {
+      // Standalone: skip PMS sync, create Task docs directly and auto-assign
+      job.status = "awaiting_assignment";
+      job.stage = 5;
+      job.pmsTaskIds = tasks.map((_, i) => `standalone-${job._id}-${i}`);
+      await job.save();
+
+      const taskDocs = tasks.map((t, i) => ({
+        jobId: job._id,
+        pmsTaskId: `standalone-${job._id}-${i}`,
+        title: t.title,
+        description: t.description ?? "",
+        type: t.type ?? "task",
+        priority: t.priority ?? "medium",
+        points: t.points ?? undefined,
+        requirementIds: t.requirementIds ?? [],
+        status: "pending",
+        repoFullName: job.repoFullName,
+      }));
+      await Task.insertMany(taskDocs);
+
+      const queues = getQueues();
+      await queues.taskAssign.add(
+        "assign-tasks",
+        { jobId: String(job._id) },
+        { jobId: `taskassign:${job._id}` },
+      );
+    } else {
+      // PMS mode: sync tasks to PMS (Stage 4 — auto)
+      job.status = "syncing_to_pms";
+      job.stage = 4;
+      await job.save();
+
+      const queues = getQueues();
+      await queues.pmsSync.add(
+        "create-tasks",
+        { jobId: String(job._id), pmsProjectId: job.pmsProjectId, tasks },
+        { jobId: `pmssync:${job._id}` },
+      );
+    }
 
     audit(req.user, "tasks.approved", {
       jobId: job._id,
-      details: { taskCount: tasks.length },
+      details: { taskCount: tasks.length, mode: job.mode },
     });
 
     res.json({ taskCount: tasks.length, job });
@@ -183,6 +234,12 @@ router.post("/:id/start-codegen", requireAuth, requireRole("admin", "manager", "
     job.status = "generating";
     job.stage = 6;
     await job.save();
+
+    // Mark Task as generating (best-effort — may not exist on legacy jobs)
+    await Task.findOneAndUpdate(
+      { jobId: job._id, pmsTaskId },
+      { status: "generating" },
+    );
 
     const queues = getQueues();
     await queues.codegen.add(
@@ -224,6 +281,12 @@ router.post("/:id/diff/approve", requireAuth, requireRole("admin", "manager", "l
     job.stage = 8;
     await job.save();
 
+    // Advance tasks that are awaiting_diff → awaiting_push
+    await Task.updateMany(
+      { jobId: job._id, status: "awaiting_diff" },
+      { status: "awaiting_push" },
+    );
+
     audit(req.user, "diff.approved", { jobId: job._id });
 
     res.json({ status: job.status, stage: job.stage });
@@ -255,6 +318,11 @@ router.post("/:id/diff/reject", requireAuth, requireRole("admin", "manager", "le
     job.status = "failed";
     job.errorMessage = `Diff rejected: ${reason}`;
     await job.save();
+
+    await Task.updateMany(
+      { jobId: job._id, status: "awaiting_diff" },
+      { status: "failed", errorMessage: `Diff rejected: ${reason}` },
+    );
 
     audit(req.user, "diff.rejected", { jobId: job._id, details: { reason } });
 
@@ -295,6 +363,19 @@ router.post("/:id/push/approve", requireAuth, requireRole("admin", "manager", "l
       const symref = await git.raw(["symbolic-ref", "refs/remotes/origin/HEAD"]);
       baseBranch = symref.trim().replace("refs/remotes/origin/", "") || "main";
     } catch {}
+
+    // Stale-branch recheck — block push on detected merge conflicts
+    const { detectConflicts } = await import("../lib/conflictDetect.js");
+    const freshConflict = await detectConflicts(git, baseBranch, job.cloneBaseSha ?? "");
+    if (freshConflict.hasConflicts === true) {
+      throw conflict(
+        `Merge conflicts detected with ${baseBranch}: ${freshConflict.message}. ` +
+        "Rebase the feature branch manually and restart from Stage 6, or cancel this job.",
+      );
+    }
+    if (freshConflict.diverged) {
+      console.warn(`[push-approve] base branch diverged (no conflicts) — proceeding with note in PR body`);
+    }
 
     // Push branch to GitHub (refreshes token before push)
     console.log(`[push-approve] pushing ${job.branchName} → ${job.repoFullName}`);
@@ -361,6 +442,12 @@ router.post("/:id/push/approve", requireAuth, requireRole("admin", "manager", "l
     job.prUrl = pr.htmlUrl;
     await job.save();
 
+    // Advance tasks awaiting_push → pr_open with PR details
+    await Task.updateMany(
+      { jobId: job._id, status: "awaiting_push" },
+      { status: "pr_open", prNumber: pr.number, prUrl: pr.htmlUrl },
+    );
+
     // Enqueue PR polling (checks every 5 min, up to 20 attempts)
     const queues = getQueues();
     await queues.prPoll.add(
@@ -381,6 +468,17 @@ router.post("/:id/push/approve", requireAuth, requireRole("admin", "manager", "l
 });
 
 // ── Cancel ────────────────────────────────────────────────────────────────────
+
+router.get("/:id/cost", requireAuth, async (req, res, next) => {
+  try {
+    const job = await Job.findById(req.params.id).lean();
+    if (!job) return next(notFound("Job not found"));
+    const summary = await getJobCostSummary(req.params.id);
+    res.json(summary);
+  } catch (err) {
+    next(err);
+  }
+});
 
 router.post("/:id/cancel", requireAuth, requireRole("admin", "manager", "lead"), async (req, res, next) => {
   try {

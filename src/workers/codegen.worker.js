@@ -48,9 +48,19 @@ import {
 } from "../lib/gitOps.js";
 import { detectConflicts } from "../lib/conflictDetect.js";
 import { audit } from "../lib/audit.js";
+import { getQueues } from "../lib/queues.js";
+import { recordCost } from "../lib/costTracker.js";
+import config from "../config/env.js";
 import Job from "../models/Job.js";
+import Task from "../models/Task.js";
 
 await connectDb();
+
+async function heartbeat(jobId, taskId) {
+  const now = new Date();
+  await Job.findByIdAndUpdate(jobId, { lastHeartbeatAt: now });
+  if (taskId) await Task.findByIdAndUpdate(taskId, { lastHeartbeatAt: now });
+}
 
 /** Sanitize a string to a safe branch-name segment (lowercase, hyphens only) */
 function toBranchSlug(str) {
@@ -65,10 +75,21 @@ const processor = async (bullJob) => {
   const { jobId, pmsTaskId } = bullJob.data;
   console.log(`[codegen-worker] start job=${jobId} pmsTaskId=${pmsTaskId}`);
 
-  // ── Step 1: Load orchestrator job ────────────────────────────────────────
+  // ── Step 1: Load orchestrator job + Task document ────────────────────────
   const orcJob = await Job.findById(jobId);
   if (!orcJob) throw new Error(`Job ${jobId} not found`);
   if (!orcJob.repoFullName) throw new Error("Job has no repoFullName");
+
+  // Find the Task document (best-effort — may not exist on legacy jobs)
+  const taskDoc = pmsTaskId
+    ? await Task.findOne({ jobId, pmsTaskId })
+    : null;
+
+  if (taskDoc) {
+    taskDoc.status = "generating";
+    taskDoc.lastHeartbeatAt = new Date();
+    await taskDoc.save();
+  }
 
   // ── Step 2: Load PMS task ─────────────────────────────────────────────────
   await pmsClient.ensureSession();
@@ -109,6 +130,7 @@ const processor = async (bullJob) => {
   }
 
   await bullJob.updateProgress(20);
+  await heartbeat(jobId, taskDoc?._id);
 
   // ── Step 5: Record base SHA ───────────────────────────────────────────────
   // Determine the base branch (default branch of the PMS project)
@@ -162,6 +184,19 @@ const processor = async (bullJob) => {
 
   console.log(`[codegen-worker] AI generated ${generated.files.length} file(s)`);
   await bullJob.updateProgress(60);
+  await heartbeat(jobId, taskDoc?._id);
+
+  // Record AI token cost
+  if (generated.usage) {
+    await recordCost({
+      jobId: String(orcJob._id),
+      taskId: taskDoc?._id ? String(taskDoc._id) : undefined,
+      operation: "generate_code",
+      model: config.openai.model,
+      promptTokens:     generated.usage.prompt_tokens     ?? 0,
+      completionTokens: generated.usage.completion_tokens ?? 0,
+    }).catch((e) => console.warn("[codegen-worker] cost record failed:", e.message));
+  }
 
   // ── Step 9: Write files (path-traversal protected) ───────────────────────
   const writtenPaths = [];
@@ -210,6 +245,7 @@ const processor = async (bullJob) => {
   await commitChanges(git, commitMsg);
 
   await bullJob.updateProgress(80);
+  await heartbeat(jobId, taskDoc?._id);
 
   // ── Step 11: Compute diff ─────────────────────────────────────────────────
   let rawDiff = "";
@@ -240,22 +276,35 @@ const processor = async (bullJob) => {
     console.warn("[codegen-worker] conflict detection failed:", err.message);
   }
 
-  // ── Step 13 + 14: Persist results and advance status ─────────────────────
-  orcJob.diffSummary = {
+  // ── Step 13: Persist diff results ────────────────────────────────────────
+  const finalDiffSummary = {
     ...diffStats,
     conflict: conflictInfo,
     writtenFiles: writtenPaths,
     blockedFiles: writeErrors,
   };
+
+  orcJob.diffSummary = finalDiffSummary;
   orcJob.clonePath = cloneDir;
-  orcJob.status = "awaiting_diff_approval";
-  orcJob.stage = 7;
+  // Job advances to quality_gate (Stage 3 is handled by qualityGate.worker)
+  orcJob.status = "quality_gate";
 
   if (writeErrors.length > 0) {
     orcJob.errorMessage = `${writeErrors.length} file(s) blocked by security policy: ${writeErrors.slice(0, 3).join("; ")}`;
   }
 
   await orcJob.save();
+
+  // Update Task document with branch + diff info and queue for quality gate
+  if (taskDoc) {
+    taskDoc.status = "quality_gate";
+    taskDoc.branchName = branchName;
+    taskDoc.clonePath = cloneDir;
+    taskDoc.diffSummary = finalDiffSummary;
+    taskDoc.repoFullName = orcJob.repoFullName;
+    taskDoc.lastHeartbeatAt = new Date();
+    await taskDoc.save();
+  }
 
   audit("system", "codegen.completed", {
     jobId: orcJob._id,
@@ -267,6 +316,22 @@ const processor = async (bullJob) => {
       conflictDiverged: conflictInfo?.diverged ?? false,
     },
   });
+
+  // ── Step 14: Enqueue quality gate ────────────────────────────────────────
+  if (taskDoc) {
+    const queues = getQueues();
+    await queues.qualityGate.add(
+      "run-quality-gate",
+      { jobId: String(orcJob._id), taskId: String(taskDoc._id) },
+      { jobId: `qgate:${orcJob._id}:${taskDoc._id}` },
+    );
+    console.log(`[codegen-worker] enqueued quality-gate for task=${taskDoc._id}`);
+  } else {
+    // Legacy job with no Task document — skip quality gate, advance directly
+    orcJob.status = "awaiting_diff_approval";
+    orcJob.stage = 7;
+    await orcJob.save();
+  }
 
   await bullJob.updateProgress(100);
   console.log(`[codegen-worker] done job=${jobId} branch=${branchName} files=${writtenPaths.length}`);
@@ -285,19 +350,26 @@ const worker = new Worker("codegen", processor, {
 });
 
 worker.on("failed", async (bullJob, err) => {
-  console.error(`[codegen-worker] failed job=${bullJob?.data?.jobId}:`, err.message);
-  if (bullJob?.data?.jobId) {
+  const { jobId, pmsTaskId } = bullJob?.data ?? {};
+  console.error(`[codegen-worker] failed job=${jobId}:`, err.message);
+  if (jobId) {
     try {
-      // Clean up clone on failure
-      const cloneDir = cloneDirForJob(bullJob.data.jobId);
+      const cloneDir = cloneDirForJob(jobId);
       await cleanupClone(cloneDir);
 
-      await Job.findByIdAndUpdate(bullJob.data.jobId, {
+      await Job.findByIdAndUpdate(jobId, {
         status: "failed",
         errorMessage: `Code generation failed: ${err.message}`,
       });
+
+      if (pmsTaskId) {
+        await Task.findOneAndUpdate(
+          { jobId, pmsTaskId },
+          { status: "failed", errorMessage: `Code generation failed: ${err.message}` },
+        );
+      }
     } catch (dbErr) {
-      console.error("[codegen-worker] could not update job status:", dbErr.message);
+      console.error("[codegen-worker] could not update status:", dbErr.message);
     }
   }
 });

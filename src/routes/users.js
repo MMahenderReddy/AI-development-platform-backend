@@ -117,4 +117,38 @@ router.patch("/:id/status", requireAuth, requireRole("admin"), async (req, res, 
   }
 });
 
+// ── Update skills ─────────────────────────────────────────────────────────────
+router.patch("/:id/skills", requireAuth, async (req, res, next) => {
+  try {
+    // Members can update their own skills; admin/manager can update anyone's
+    const isSelf = String(req.params.id) === String(req.user._id);
+    if (!isSelf && !["admin", "manager"].includes(req.user.role)) {
+      const { forbidden: forbid } = await import("../lib/errors.js");
+      return next(forbid("Requires admin or manager role, or updating your own skills"));
+    }
+
+    const raw = req.body?.skills;
+    if (!Array.isArray(raw)) throw badRequest("skills must be an array of strings");
+    const skills = raw
+      .map((s) => String(s).trim().slice(0, 50))
+      .filter(Boolean)
+      .slice(0, 30);
+
+    const user = await OrchestratorUser.findByIdAndUpdate(
+      req.params.id,
+      { skills },
+      { new: true, select: "-passwordHash" }
+    );
+    if (!user) throw notFound("User");
+
+    audit(req.user, "users.skills_updated", {
+      details: { targetEmail: user.email, skills },
+    });
+
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
 export default router;

@@ -23,6 +23,7 @@ import { pmsClient } from "../lib/pmsClient.js";
 import { cleanupClone } from "../lib/gitOps.js";
 import { audit } from "../lib/audit.js";
 import Job from "../models/Job.js";
+import Task from "../models/Task.js";
 
 await connectDb();
 
@@ -58,6 +59,35 @@ const processor = async (bullJob) => {
     throw new Error(`GitHub getPull failed: ${err.message}`);
   }
 
+  // Check for changes-requested reviews before processing merged/closed state
+  if (pr.state !== "merged" && pr.state !== "closed") {
+    try {
+      const reviews = await githubClient.getPullReviews(repoFullName, prNumber);
+      // Find the latest non-dismissed review state per reviewer
+      const latestByUser = new Map();
+      for (const r of reviews) {
+        if (r.state !== "DISMISSED") latestByUser.set(r.user, r.state);
+      }
+      const hasChangesRequested = [...latestByUser.values()].some((s) => s === "CHANGES_REQUESTED");
+      if (hasChangesRequested) {
+        await Task.updateMany(
+          { jobId: orcJob._id, status: "pr_open" },
+          { status: "changes_requested" },
+        );
+        await Job.findByIdAndUpdate(orcJob._id, { status: "pr_open" }); // job stays pr_open; task shows changes_requested
+        console.log(`[pr-poll-worker] PR #${prNumber} has changes_requested — tasks updated`);
+      } else {
+        // Clear changes_requested if reviewer approved since last check
+        await Task.updateMany(
+          { jobId: orcJob._id, status: "changes_requested" },
+          { status: "pr_open" },
+        );
+      }
+    } catch (reviewErr) {
+      console.warn(`[pr-poll-worker] could not fetch reviews for PR #${prNumber}:`, reviewErr.message);
+    }
+  }
+
   if (pr.state === "merged") {
     console.log(`[pr-poll-worker] PR #${prNumber} merged — completing job ${jobId}`);
 
@@ -86,6 +116,12 @@ const processor = async (bullJob) => {
     orcJob.stage = 10;
     await orcJob.save();
 
+    // Mark all pr_open tasks for this job as merged
+    await Task.updateMany(
+      { jobId: orcJob._id, status: "pr_open" },
+      { status: "merged" },
+    );
+
     audit("system", "pr.merged", {
       jobId: orcJob._id,
       details: { prNumber, repoFullName },
@@ -103,6 +139,11 @@ const processor = async (bullJob) => {
       status: "failed",
       errorMessage: `PR #${prNumber} was closed without merging. Start a new job to retry.`,
     });
+
+    await Task.updateMany(
+      { jobId: orcJob._id, status: "pr_open" },
+      { status: "failed", errorMessage: `PR #${prNumber} closed without merging` },
+    );
 
     audit("system", "pr.closed_without_merge", {
       jobId: orcJob._id,

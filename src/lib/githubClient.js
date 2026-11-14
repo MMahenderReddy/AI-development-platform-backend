@@ -61,7 +61,9 @@ const getToken = async () => {
 
 // ── GitHub API Helper ────────────────────────────────────────────────────────
 
-const ghRequest = async (method, path, body) => {
+const MAX_RATE_LIMIT_WAIT_MS = 2 * 60_000; // cap waits at 2 minutes
+
+const ghRequest = async (method, path, body, _retried = false) => {
   const token = await getToken();
   const res = await fetch(`https://api.github.com${path}`, {
     method,
@@ -74,11 +76,28 @@ const ghRequest = async (method, path, body) => {
     body: body ? JSON.stringify(body) : undefined,
   });
 
+  // Handle rate limiting — parse Retry-After or X-RateLimit-Reset, wait once
+  if (!_retried && (res.status === 429 || (res.status === 403 && res.headers.get("X-RateLimit-Remaining") === "0"))) {
+    let waitMs = 60_000;
+    const retryAfter = res.headers.get("Retry-After");
+    const rlReset = res.headers.get("X-RateLimit-Reset");
+    if (retryAfter) {
+      waitMs = Number(retryAfter) * 1000;
+    } else if (rlReset) {
+      waitMs = Math.max(1000, Number(rlReset) * 1000 - Date.now() + 1000);
+    }
+    waitMs = Math.min(waitMs, MAX_RATE_LIMIT_WAIT_MS);
+    console.warn(`[github] rate limited — waiting ${Math.round(waitMs / 1000)}s (${method} ${path})`);
+    await new Promise((r) => setTimeout(r, waitMs));
+    return ghRequest(method, path, body, true);
+  }
+
   if (!res.ok) {
     const data = await res.json().catch(() => ({}));
     const err = new Error(data.message ?? `GitHub API error ${res.status}`);
     err.status = res.status;
-    err.code = res.status === 409 ? "CONFLICT" : res.status === 404 ? "NOT_FOUND" : "GITHUB_ERROR";
+    err.code = res.status === 409 ? "CONFLICT" : res.status === 404 ? "NOT_FOUND"
+      : (res.status === 429 || res.status === 403) ? "RATE_LIMITED" : "GITHUB_ERROR";
     throw err;
   }
   return res.status === 204 ? {} : res.json();
@@ -147,4 +166,14 @@ export const githubClient = {
       mergeable: p.mergeable,
       headSha: p.head.sha,
     })),
+
+  /** List reviews for a pull request. Returns array of { user, state, submittedAt }. */
+  getPullReviews: (fullName, number) =>
+    ghRequest("GET", `/repos/${fullName}/pulls/${number}/reviews`).then((reviews) =>
+      (reviews ?? []).map((r) => ({
+        user: r.user?.login ?? "unknown",
+        state: r.state,
+        submittedAt: r.submitted_at,
+      })),
+    ),
 };

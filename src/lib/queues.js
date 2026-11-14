@@ -3,11 +3,12 @@
  * Import this file to get queue instances; each call returns the same singleton.
  *
  * Queue concurrency rules (from architecture design):
- *  analysis-queue   concurrency 3 — read-only AI analysis, safe to parallelise
- *  codegen-queue    concurrency 1 — serialised per queue instance; prevents parallel
- *                                   write conflicts on the same repo
- *  pms-sync-queue   concurrency 3 — PMS REST calls are rate-limited
- *  pr-poll-queue    concurrency 5 — lightweight polling
+ *  analysis-queue     concurrency 3 — read-only AI analysis, safe to parallelise
+ *  codegen-queue      concurrency 1 — serialised per queue instance; prevents parallel
+ *                                     write conflicts on the same repo
+ *  pms-sync-queue     concurrency 3 — PMS REST calls are rate-limited
+ *  pr-poll-queue      concurrency 5 — lightweight polling
+ *  task-assign-queue  concurrency 3 — assignment engine, reads DB only
  */
 import { Queue } from "bullmq";
 import { getRedis } from "./redis.js";
@@ -31,6 +32,14 @@ export const getQueues = () => {
     prPoll: new Queue("pr-poll", {
       connection,
       defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 20, backoff: { type: "fixed", delay: 5 * 60_000 } },
+    }),
+    taskAssign: new Queue("task-assign", {
+      connection,
+      defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 3, backoff: { type: "exponential", delay: 10_000 } },
+    }),
+    qualityGate: new Queue("quality-gate", {
+      connection,
+      defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 2, backoff: { type: "fixed", delay: 5_000 } },
     }),
   };
   return _queues;
