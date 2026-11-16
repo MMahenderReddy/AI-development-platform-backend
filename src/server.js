@@ -3,6 +3,8 @@ import express from "express";
 import helmet from "helmet";
 import cors from "cors";
 import cookieParser from "cookie-parser";
+import path from "path";
+import { mkdirSync } from "fs";
 import { connectDb } from "./lib/db.js";
 import { getRedis } from "./lib/redis.js";
 import { pmsClient } from "./lib/pmsClient.js";
@@ -23,6 +25,9 @@ import { apiLimiter, authLimiter, uploadLimiter, jobCreateLimiter } from "./midd
 import { ApiError } from "./lib/errors.js";
 import { runStartupRecovery } from "./lib/recoveryJob.js";
 
+// Ensure uploads root exists on startup
+mkdirSync(path.resolve("./uploads"), { recursive: true });
+
 const app = express();
 
 app.use(helmet());
@@ -37,7 +42,7 @@ app.get("/health", (_req, res) => {
 
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 app.use("/api/auth", authLimiter);
-app.use("/api/documents", uploadLimiter);
+app.use("/api/documents/upload", uploadLimiter); // tighter limit for file uploads only
 app.use("/api/jobs", apiLimiter);
 app.use("/api", apiLimiter);
 
@@ -93,6 +98,7 @@ const start = async () => {
   app.listen(config.port, () => {
     console.log(`[server] AI Development Orchestrator listening on http://localhost:${config.port}`);
     console.log(`[server] env: ${config.nodeEnv} | AI model: ${config.openai.model}`);
+    console.log(`[server] uploads stored locally at: ${path.resolve("./uploads")}`);
   });
 };
 

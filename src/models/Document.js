@@ -16,6 +16,8 @@ const requirementSchema = new Schema(
 const docSchema = new Schema(
   {
     jobId: { type: Schema.Types.ObjectId, ref: "Job", required: true },
+    projectId: { type: Schema.Types.ObjectId, ref: "Project" },
+    projectSlug: { type: String, default: "" },
     originalName: { type: String, required: true },
     mimeType: String,
     sizeBytes: Number,
@@ -29,5 +31,6 @@ const docSchema = new Schema(
 );
 
 docSchema.index({ jobId: 1 });
+docSchema.index({ projectId: 1 });
 
 export default model("Document", docSchema);

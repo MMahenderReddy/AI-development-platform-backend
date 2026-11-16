@@ -2,5 +2,6 @@ node_modules/
 .env
 *.pem
 workspaces/
+uploads/
 dist/
 *.log

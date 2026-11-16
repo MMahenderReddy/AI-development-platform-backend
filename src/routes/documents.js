@@ -1,17 +1,34 @@
+/**
+ * Documents API
+ *
+ * POST   /documents/upload/:projectId  — upload a doc, auto-create a job, start analysis
+ * GET    /documents/project/:projectId — list all docs for a project
+ * GET    /documents/:id                — get one document with requirements
+ * GET    /documents/:id/file           — download the original file (auth-gated)
+ * PATCH  /documents/:id/requirements/:reqId — edit a requirement
+ * POST   /documents/:id/requirements/approve — bulk approve requirements
+ *
+ * Files are stored locally under:
+ *   ./uploads/<project-slug>/<timestamp>_<safe-filename>
+ *
+ * No S3 or external storage — all files stay on this server.
+ */
 import { Router } from "express";
 import multer from "multer";
 import path from "path";
+import { createReadStream } from "fs";
 import { mkdirSync } from "fs";
+import mongoose from "mongoose";
 import Document from "../models/Document.js";
 import Job from "../models/Job.js";
-import Approval from "../models/Approval.js";
+import Project from "../models/Project.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
 import { notFound, badRequest } from "../lib/errors.js";
 import { getQueues } from "../lib/queues.js";
 import { audit } from "../lib/audit.js";
+import config from "../config/env.js";
 
-const UPLOAD_DIR = path.resolve("./uploads");
-mkdirSync(UPLOAD_DIR, { recursive: true });
+const BASE_UPLOAD_DIR = path.resolve(config.sandbox.workspaceDir ? "./uploads" : "./uploads");
 
 const ALLOWED_MIME_TYPES = new Set([
   "application/pdf",
@@ -21,8 +38,31 @@ const ALLOWED_MIME_TYPES = new Set([
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 ]);
 
+// ── Middleware: resolve project from :projectId (ObjectId or slug) ────────────
+async function resolveProject(req, res, next) {
+  try {
+    const idOrSlug = req.params.projectId;
+    const isObjectId = mongoose.Types.ObjectId.isValid(idOrSlug);
+    const project = await Project.findOne(
+      isObjectId
+        ? { $or: [{ _id: idOrSlug }, { projectId: idOrSlug }] }
+        : { projectId: idOrSlug }
+    );
+    if (!project) return next(notFound("Project"));
+
+    req.project = project;
+    // Folder name: use the project slug (guaranteed unique by Project model)
+    req.uploadDir = path.resolve(BASE_UPLOAD_DIR, project.projectId);
+    mkdirSync(req.uploadDir, { recursive: true });
+    next();
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── Multer: destination is set dynamically by resolveProject middleware ────────
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  destination: (req, file, cb) => cb(null, req.uploadDir),
   filename: (req, file, cb) => {
     const safe = file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 100);
     cb(null, `${Date.now()}_${safe}`);
@@ -32,7 +72,7 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: { fileSize: 20 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
+  fileFilter: (_req, file, cb) => {
     if (ALLOWED_MIME_TYPES.has(file.mimetype)) return cb(null, true);
     cb(new Error(`Unsupported file type: ${file.mimetype}`));
   },
@@ -40,68 +80,151 @@ const upload = multer({
 
 const router = Router();
 
-// ── Upload a document and kick off analysis ───────────────────────────────────
+// ── Upload a document → auto-create job → start analysis ─────────────────────
+router.post(
+  "/upload/:projectId",
+  requireAuth,
+  requireRole("admin", "manager", "lead"),
+  resolveProject,
+  upload.single("document"),
+  async (req, res, next) => {
+    try {
+      const project = req.project;
 
-router.post("/upload/:jobId", requireAuth, requireRole("admin", "manager", "lead"), upload.single("document"), async (req, res, next) => {
+      // Reject if the project already has an active job
+      const ACTIVE = [
+        "pending", "analyzing", "generating_tasks", "syncing_to_pms",
+        "awaiting_assignment", "auto_assigning", "generating",
+        "quality_gate", "pushed", "integrating", "pr_open",
+      ];
+      const activeJob = await Job.findOne({ projectId: project._id, status: { $in: ACTIVE } });
+      if (activeJob) {
+        return next(badRequest(`Project "${project.name}" already has an active job (${activeJob.status}). Wait for it to complete or cancel it first.`));
+      }
+
+      // Determine repo from project config
+      const repoFullName =
+        project.repoConfig?.defaultRepo ||
+        project.repoConfig?.backendRepo ||
+        project.repoConfig?.frontendRepo ||
+        "";
+
+      // Create the job
+      const job = await Job.create({
+        projectId: project._id,
+        pmsProjectId: project.pmsProjectId ?? project.projectId,
+        repoFullName,
+        status: "analyzing",
+        stage: 2,
+      });
+
+      // Create the document record
+      const doc = await Document.create({
+        jobId: job._id,
+        projectId: project._id,
+        projectSlug: project.projectId,
+        originalName: req.file.originalname,
+        mimeType: req.file.mimetype,
+        sizeBytes: req.file.size,
+        storagePath: req.file.path,
+        uploadedBy: req.user._id,
+      });
+
+      job.documentId = doc._id;
+      await job.save();
+
+      // Enqueue analysis
+      const queues = getQueues();
+      await queues.analysis.add(
+        "analyze",
+        { jobId: String(job._id), documentId: String(doc._id) },
+        { jobId: `analysis:${job._id}` },
+      );
+
+      audit(req.user, "document.uploaded", {
+        jobId: job._id,
+        details: {
+          projectId: project._id,
+          projectSlug: project.projectId,
+          fileName: req.file.originalname,
+          sizeBytes: req.file.size,
+          storedAt: req.file.path,
+        },
+      });
+
+      res.status(201).json({ document: doc, job });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
+
+// ── List all documents for a project ─────────────────────────────────────────
+router.get("/project/:projectId", requireAuth, async (req, res, next) => {
   try {
-    const job = await Job.findById(req.params.jobId);
-    if (!job) throw notFound("Job");
-    if (job.status !== "pending") throw badRequest("Job already has a document attached");
+    const idOrSlug = req.params.projectId;
+    const isObjectId = mongoose.Types.ObjectId.isValid(idOrSlug);
+    const project = await Project.findOne(
+      isObjectId
+        ? { $or: [{ _id: idOrSlug }, { projectId: idOrSlug }] }
+        : { projectId: idOrSlug }
+    ).lean();
+    if (!project) return next(notFound("Project"));
 
-    const doc = await Document.create({
-      jobId: job._id,
-      originalName: req.file.originalname,
-      mimeType: req.file.mimetype,
-      sizeBytes: req.file.size,
-      storagePath: req.file.path,
-      uploadedBy: req.user._id,
-    });
+    const docs = await Document.find({ projectId: project._id })
+      .sort({ createdAt: -1 })
+      .select("-extractedText -requirements")
+      .lean();
 
-    job.documentId = doc._id;
-    job.status = "analyzing";
-    job.stage = 2;
-    await job.save();
-
-    // Enqueue the analysis job — the worker will parse and extract requirements
-    const queues = getQueues();
-    await queues.analysis.add(
-      "analyze",
-      { jobId: String(job._id), documentId: String(doc._id) },
-      { jobId: `analysis:${job._id}` },
-    );
-
-    audit(req.user, "document.uploaded", {
-      jobId: job._id,
-      details: { fileName: req.file.originalname, sizeBytes: req.file.size },
-    });
-
-    res.status(201).json({ document: doc, job });
+    res.json(docs);
   } catch (err) {
     next(err);
   }
 });
 
 // ── Get document with requirements ───────────────────────────────────────────
-
 router.get("/:id", requireAuth, async (req, res, next) => {
   try {
     const doc = await Document.findById(req.params.id).lean();
-    if (!doc) throw notFound("Document");
+    if (!doc) return next(notFound("Document"));
     res.json(doc);
   } catch (err) {
     next(err);
   }
 });
 
-// ── Update individual requirement (edit text before approval) ─────────────────
+// ── Download the original file (auth-gated, streamed) ────────────────────────
+router.get("/:id/file", requireAuth, async (req, res, next) => {
+  try {
+    const doc = await Document.findById(req.params.id).lean();
+    if (!doc) return next(notFound("Document"));
+    if (!doc.storagePath) return next(notFound("File not stored on this server"));
 
+    const absPath = path.resolve(doc.storagePath);
+    // Safety check: file must be inside the uploads directory
+    if (!absPath.startsWith(path.resolve(BASE_UPLOAD_DIR))) {
+      return res.status(403).json({ error: "FORBIDDEN", message: "Path traversal denied" });
+    }
+
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(doc.originalName)}"`);
+    if (doc.mimeType) res.setHeader("Content-Type", doc.mimeType);
+
+    const stream = createReadStream(absPath);
+    stream.on("error", () => res.status(404).json({ error: "NOT_FOUND", message: "File not found on disk" }));
+    stream.pipe(res);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Update individual requirement ─────────────────────────────────────────────
 router.patch("/:id/requirements/:reqId", requireAuth, requireRole("admin", "manager", "lead"), async (req, res, next) => {
   try {
     const doc = await Document.findById(req.params.id);
-    if (!doc) throw notFound("Document");
+    if (!doc) return next(notFound("Document"));
 
     const req_ = doc.requirements.find((r) => r.id === req.params.reqId);
-    if (!req_) throw notFound("Requirement");
+    if (!req_) return next(notFound("Requirement"));
 
     const { editedText, priority, category } = req.body ?? {};
     if (editedText !== undefined) req_.editedText = String(editedText).slice(0, 500).trim();
@@ -115,21 +238,17 @@ router.patch("/:id/requirements/:reqId", requireAuth, requireRole("admin", "mana
   }
 });
 
-// ── Approve / reject requirements in bulk ────────────────────────────────────
-
+// ── Bulk approve requirements ─────────────────────────────────────────────────
 router.post("/:id/requirements/approve", requireAuth, requireRole("admin", "manager", "lead"), async (req, res, next) => {
   try {
     const { approvedIds, rejectedIds } = req.body ?? {};
-    if (!Array.isArray(approvedIds)) throw badRequest("approvedIds must be an array");
+    if (!Array.isArray(approvedIds)) return next(badRequest("approvedIds must be an array"));
 
     const doc = await Document.findById(req.params.id);
-    if (!doc) throw notFound("Document");
+    if (!doc) return next(notFound("Document"));
 
     const job = await Job.findById(doc.jobId);
-    if (!job) throw notFound("Job");
-    if (job.status !== "awaiting_requirements_approval") {
-      throw badRequest(`Cannot approve requirements in status: ${job.status}`);
-    }
+    if (!job) return next(notFound("Job"));
 
     const approved = new Set(approvedIds);
     const rejected = new Set(Array.isArray(rejectedIds) ? rejectedIds : []);
@@ -144,26 +263,14 @@ router.post("/:id/requirements/approve", requireAuth, requireRole("admin", "mana
     }
 
     const approvedCount = doc.requirements.filter((r) => r.approved).length;
-    if (approvedCount === 0) throw badRequest("At least one requirement must be approved");
+    if (approvedCount === 0) return next(badRequest("At least one requirement must be approved"));
 
     await doc.save();
 
-    // Record the approval
-    await Approval.create({
-      jobId: job._id,
-      stage: 2,
-      stageName: "requirements_review",
-      decision: "approved",
-      approvedBy: req.user._id,
-      payload: { approvedIds, rejectedIds },
-    });
-
-    // Advance job — AI task generation is about to run (auto Stage 4)
     job.status = "generating_tasks";
     job.stage = 3;
     await job.save();
 
-    // Enqueue task generation
     const queues = getQueues();
     await queues.analysis.add(
       "generate-tasks",
