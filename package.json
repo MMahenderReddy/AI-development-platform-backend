@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
+    "dev:all": "concurrently -n api,analysis,codegen,qgate,push,rework,integration,pms,assign,prpoll,deploy -c blue,green,cyan,yellow,magenta,red,white,gray,greenBright,cyanBright,yellowBright \"npm run dev\" \"npm run worker:analysis\" \"npm run worker:codegen\" \"npm run worker:quality-gate\" \"npm run worker:push\" \"npm run worker:rework\" \"npm run worker:integration\" \"npm run worker:pms-sync\" \"npm run worker:task-assignment\" \"npm run worker:pr-poll\" \"npm run worker:deploy\"",
     "worker:analysis": "node --watch src/workers/analysis.worker.js",
     "worker:codegen": "node --watch src/workers/codegen.worker.js",
     "worker:quality-gate": "node --watch src/workers/qualityGate.worker.js",
@@ -45,6 +46,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^9.25.0",
+    "concurrently": "^9.2.5",
     "eslint": "^9.25.0",
     "globals": "^16.0.0"
   }

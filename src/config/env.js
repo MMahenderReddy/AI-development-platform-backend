@@ -59,7 +59,6 @@ export default {
   },
 
   sandbox: {
-    mode: optional("ORCHESTRATOR_SANDBOX_MODE", "process"),
     jobTimeoutMs: Number(optional("ORCHESTRATOR_JOB_TIMEOUT_MS", "600000")),
     workspaceDir: optional("ORCHESTRATOR_WORKSPACE_DIR", "./workspaces"),
   },
