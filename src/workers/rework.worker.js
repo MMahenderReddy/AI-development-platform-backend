@@ -137,7 +137,7 @@ const processor = async (bullJob) => {
   await queues.codegen.add(
     "generate-code",
     { jobId: String(orcJob._id), pmsTaskId: reworkTask.pmsTaskId },
-    { jobId: `codegen:${orcJob._id}:${reworkTask.pmsTaskId}`, delay: REWORK_STAGGER_MS },
+    { jobId: `codegen-${orcJob._id}-${reworkTask.pmsTaskId}`, delay: REWORK_STAGGER_MS },
   );
 
   console.log(`[rework-worker] enqueued rework task ${reworkTask._id} in codegen`);

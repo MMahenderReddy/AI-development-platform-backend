@@ -178,7 +178,7 @@ router.post("/:id/tasks/approve", requireAuth, requireRole("admin", "manager", "
       await queues.taskAssign.add(
         "assign-tasks",
         { jobId: String(job._id) },
-        { jobId: `taskassign:${job._id}` },
+        { jobId: `taskassign-${job._id}` },
       );
     } else {
       // PMS mode: sync tasks to PMS (Stage 4 — auto)
@@ -190,7 +190,7 @@ router.post("/:id/tasks/approve", requireAuth, requireRole("admin", "manager", "
       await queues.pmsSync.add(
         "create-tasks",
         { jobId: String(job._id), pmsProjectId: job.pmsProjectId, tasks },
-        { jobId: `pmssync:${job._id}` },
+        { jobId: `pmssync-${job._id}` },
       );
     }
 
@@ -250,7 +250,7 @@ router.post("/:id/start-codegen", requireAuth, requireRole("admin", "manager", "
     await queues.codegen.add(
       "generate-code",
       { jobId: String(job._id), pmsTaskId },
-      { jobId: `codegen:${job._id}:${pmsTaskId}` },
+      { jobId: `codegen-${job._id}-${pmsTaskId}` },
     );
 
     audit(req.user, "codegen.started", { jobId: job._id, details: { pmsTaskId, assigneeId: req.body?.assigneeId } });
@@ -458,7 +458,7 @@ router.post("/:id/push/approve", requireAuth, requireRole("admin", "manager", "l
     await queues.prPoll.add(
       "poll-pr",
       { jobId: String(job._id), prNumber: pr.number, repoFullName: job.repoFullName },
-      { jobId: `prpoll:${job._id}:${pr.number}` },
+      { jobId: `prpoll-${job._id}-${pr.number}` },
     );
 
     audit(req.user, "push.approved", {

@@ -116,6 +116,7 @@ router.post(
         repoFullName,
         status: "analyzing",
         stage: 2,
+        createdBy: req.user._id,
       });
 
       // Create the document record
@@ -138,7 +139,7 @@ router.post(
       await queues.analysis.add(
         "analyze",
         { jobId: String(job._id), documentId: String(doc._id) },
-        { jobId: `analysis:${job._id}` },
+        { jobId: `analysis-${job._id}` },
       );
 
       audit(req.user, "document.uploaded", {
@@ -275,7 +276,7 @@ router.post("/:id/requirements/approve", requireAuth, requireRole("admin", "mana
     await queues.analysis.add(
       "generate-tasks",
       { jobId: String(job._id), documentId: String(doc._id) },
-      { jobId: `gentasks:${job._id}` },
+      { jobId: `gentasks-${job._id}` },
     );
 
     audit(req.user, "requirements.approved", {

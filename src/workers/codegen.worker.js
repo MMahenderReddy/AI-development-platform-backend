@@ -5,20 +5,28 @@
  * Job data: { jobId: string, pmsTaskId: string }
  *
  * Flow:
- *  1.  Load the orchestrator Job
- *  2.  Load the PMS task (title, description, type, priority, points)
- *  3.  Set up a persistent clone directory: <workspaceDir>/clones/<jobId>
- *  4.  Clone the repo (or wipe and re-clone if stale)
- *  5.  Record the base branch HEAD SHA (cloneBaseSha)
- *  6.  Create feature branch: orch/<shortJobId>/<kebabTitle>
- *  7.  Build codebase context from tracked files
- *  8.  Call OpenAI generateCodeForTask
- *  9.  Write each AI-generated file via writeFileSafe (path-traversal protected)
- * 10.  Commit with bot identity (never impersonates a human)
- * 11.  Compute diff + parse stats
- * 12.  Check for base-branch conflicts (non-blocking warning)
- * 13.  Save branch name, diff, clone path and conflict info on the Job
- * 14.  Advance job → awaiting_diff_approval (Stage 7)
+ *  1.  Load the orchestrator Job + Task document
+ *  2.  Acquire a per-repo Redis lock (serializes codegen within the same repo,
+ *      allows parallel runs across different repos)
+ *  3.  Load the PMS task (title, description, type, priority, points)
+ *  4.  Set up a per-task isolated clone directory: <workspaceDir>/clones/<jobId>/<taskId>
+ *  5.  Clone the repo fresh (guarantees latest main, avoids stale-clone conflicts)
+ *  6.  Record the base branch HEAD SHA (cloneBaseSha)
+ *  7.  Create feature branch: orch/<shortJobId>/<kebabTitle>
+ *  8.  Build codebase context from tracked files
+ *  9.  Call OpenAI generateCodeForTask
+ * 10.  Write each AI-generated file via writeFileSafe (path-traversal protected)
+ * 11.  Commit with bot identity (never impersonates a human)
+ * 12.  Compute diff + parse stats
+ * 13.  Check for base-branch conflicts (non-blocking warning)
+ * 14.  Save branch name, diff, clone path and conflict info on the Task + Job
+ * 15.  Enqueue quality gate; release repo lock
+ *
+ * Concurrency model:
+ *  - Worker concurrency: 5  (up to 5 tasks running in parallel across repos)
+ *  - Per-repo lock (Redis SET NX EX): only one task at a time per repo
+ *    so two tasks touching the same repo serialize naturally while tasks
+ *    on different repos run fully in parallel.
  *
  * Security constraints enforced:
  *  - BOT_NAME / BOT_EMAIL on every commit — no human impersonation
@@ -34,7 +42,7 @@ import { pmsClient } from "../lib/pmsClient.js";
 import { generateCodeForTask } from "../lib/openaiClient.js";
 import { writeFileSafe } from "../lib/fileSandbox.js";
 import {
-  cloneDirForJob,
+  cloneDirForTask,
   cloneRepo,
   createBranch,
   commitChanges,
@@ -55,6 +63,42 @@ import Job from "../models/Job.js";
 import Task from "../models/Task.js";
 
 await connectDb();
+
+// ── Per-repo distributed lock (ioredis SET NX EX) ────────────────────────────
+// Prevents two tasks on the same repo from cloning/branching simultaneously.
+// Lock TTL is generous (15 min) — released explicitly in finally{} on every path.
+const LOCK_TTL_S = 15 * 60;
+const LOCK_RETRY_MS = 5_000;
+const LOCK_MAX_WAIT_MS = 10 * 60_000; // give up after 10 min of waiting
+
+async function acquireRepoLock(repoFullName, taskId) {
+  const key = `codegen:lock:${repoFullName.replace(/\//g, ":")}`;
+  const value = String(taskId);
+  const deadline = Date.now() + LOCK_MAX_WAIT_MS;
+  while (Date.now() < deadline) {
+    const ok = await getRedis().set(key, value, "NX", "EX", LOCK_TTL_S);
+    if (ok === "OK") {
+      console.log(`[codegen-worker] acquired repo lock for ${repoFullName} (task=${taskId})`);
+      return key;
+    }
+    const holder = await getRedis().get(key);
+    console.log(`[codegen-worker] repo ${repoFullName} locked by task=${holder}, waiting ${LOCK_RETRY_MS}ms…`);
+    await new Promise((r) => setTimeout(r, LOCK_RETRY_MS));
+  }
+  throw new Error(`Could not acquire repo lock for ${repoFullName} within ${LOCK_MAX_WAIT_MS / 1000}s`);
+}
+
+async function releaseRepoLock(lockKey, taskId) {
+  try {
+    const holder = await getRedis().get(lockKey);
+    if (holder === String(taskId)) {
+      await getRedis().del(lockKey);
+      console.log(`[codegen-worker] released repo lock ${lockKey}`);
+    }
+  } catch (e) {
+    console.warn(`[codegen-worker] could not release lock ${lockKey}:`, e.message);
+  }
+}
 
 async function heartbeat(jobId, taskId) {
   const now = new Date();
@@ -94,7 +138,14 @@ const processor = async (bullJob) => {
     await taskDoc.save();
   }
 
-  // ── Step 2: Load PMS task ─────────────────────────────────────────────────
+  // ── Step 2: Acquire per-repo lock ─────────────────────────────────────────
+  // Serializes within the same repo; tasks on different repos run in parallel.
+  const lockId = taskDoc?._id ?? `${jobId}-${pmsTaskId}`;
+  const lockKey = await acquireRepoLock(repoFullName, lockId);
+
+  try {
+
+  // ── Step 3: Load PMS task ─────────────────────────────────────────────────
   await pmsClient.ensureSession();
   let pmsTask;
   try {
@@ -114,16 +165,18 @@ const processor = async (bullJob) => {
   await bullJob.updateProgress(5);
   console.log(`[codegen-worker] implementing: "${task.title}"`);
 
-  // ── Step 3: Set up clone directory ────────────────────────────────────────
-  const cloneDir = cloneDirForJob(jobId);
+  // ── Step 4: Set up per-task isolated clone directory ─────────────────────
+  // Each task gets its own dir (clones/<jobId>/<taskId>) so tasks of the same
+  // job never wipe each other's working tree.
+  const cloneDir = cloneDirForTask(jobId, String(taskDoc?._id ?? pmsTaskId));
 
-  // If a stale clone exists, remove it and start fresh
+  // If a stale clone exists (e.g. from a failed prior attempt), remove it
   if (existsSync(cloneDir)) {
     console.log(`[codegen-worker] removing stale clone at ${cloneDir}`);
     await cleanupClone(cloneDir);
   }
 
-  // ── Step 4: Clone repo ────────────────────────────────────────────────────
+  // ── Step 5: Clone repo ────────────────────────────────────────────────────
   console.log(`[codegen-worker] cloning ${repoFullName} → ${cloneDir}`);
   let git;
   try {
@@ -135,7 +188,7 @@ const processor = async (bullJob) => {
   await bullJob.updateProgress(20);
   await heartbeat(jobId, taskDoc?._id);
 
-  // ── Step 5: Record base SHA ───────────────────────────────────────────────
+  // ── Step 6: Record base SHA ───────────────────────────────────────────────
   // Determine the base branch (default branch of the PMS project)
   let baseBranch = "main";
   try {
@@ -146,7 +199,7 @@ const processor = async (bullJob) => {
   const cloneBaseSha = await getHeadSha(git);
   orcJob.cloneBaseSha = cloneBaseSha;
 
-  // ── Step 6: Create feature branch ────────────────────────────────────────
+  // ── Step 7: Create feature branch ────────────────────────────────────────
   const shortJobId = String(jobId).slice(-8);
   const branchName = `orch/${shortJobId}/${toBranchSlug(task.title)}`;
   try {
@@ -160,7 +213,7 @@ const processor = async (bullJob) => {
 
   await bullJob.updateProgress(30);
 
-  // ── Step 7: Build codebase context ───────────────────────────────────────
+  // ── Step 8: Build codebase context ───────────────────────────────────────
   console.log(`[codegen-worker] building codebase context…`);
   let codebaseContext;
   try {
@@ -172,7 +225,7 @@ const processor = async (bullJob) => {
 
   await bullJob.updateProgress(40);
 
-  // ── Step 8: Generate code via OpenAI ─────────────────────────────────────
+  // ── Step 9: Generate code via OpenAI ─────────────────────────────────────
   console.log(`[codegen-worker] calling OpenAI to generate code…`);
   let generated;
   try {
@@ -201,7 +254,7 @@ const processor = async (bullJob) => {
     }).catch((e) => console.warn("[codegen-worker] cost record failed:", e.message));
   }
 
-  // ── Step 9: Write files (path-traversal protected) ───────────────────────
+  // ── Step 10: Write files (path-traversal protected) ──────────────────────
   const writtenPaths = [];
   const writeErrors = [];
 
@@ -232,7 +285,7 @@ const processor = async (bullJob) => {
 
   await bullJob.updateProgress(70);
 
-  // ── Step 10: Commit with bot identity ─────────────────────────────────────
+  // ── Step 11: Commit with bot identity ────────────────────────────────────
   const commitMsg = [
     generated.commitMessage || `feat: ${task.title.slice(0, 72)}`,
     "",
@@ -250,7 +303,7 @@ const processor = async (bullJob) => {
   await bullJob.updateProgress(80);
   await heartbeat(jobId, taskDoc?._id);
 
-  // ── Step 11: Compute diff ─────────────────────────────────────────────────
+  // ── Step 12: Compute diff ────────────────────────────────────────────────
   let rawDiff = "";
   try {
     rawDiff = await getDiff(git, baseBranch);
@@ -268,7 +321,7 @@ const processor = async (bullJob) => {
 
   await bullJob.updateProgress(90);
 
-  // ── Step 12: Conflict detection (non-blocking) ────────────────────────────
+  // ── Step 13: Conflict detection (non-blocking) ───────────────────────────
   let conflictInfo = null;
   try {
     conflictInfo = await detectConflicts(git, baseBranch, cloneBaseSha);
@@ -279,7 +332,7 @@ const processor = async (bullJob) => {
     console.warn("[codegen-worker] conflict detection failed:", err.message);
   }
 
-  // ── Step 13: Persist diff results ────────────────────────────────────────
+  // ── Step 14: Persist diff results ────────────────────────────────────────
   const finalDiffSummary = {
     ...diffStats,
     conflict: conflictInfo,
@@ -320,13 +373,13 @@ const processor = async (bullJob) => {
     },
   });
 
-  // ── Step 14: Enqueue quality gate ────────────────────────────────────────
+  // ── Step 15: Enqueue quality gate; lock released in finally{} ───────────
   if (taskDoc) {
     const queues = getQueues();
     await queues.qualityGate.add(
       "run-quality-gate",
       { jobId: String(orcJob._id), taskId: String(taskDoc._id) },
-      { jobId: `qgate:${orcJob._id}:${taskDoc._id}` },
+      { jobId: `qgate-${orcJob._id}-${taskDoc._id}` },
     );
     console.log(`[codegen-worker] enqueued quality-gate for task=${taskDoc._id}`);
   } else {
@@ -335,7 +388,7 @@ const processor = async (bullJob) => {
     await queues.push.add(
       "push-branch",
       { jobId: String(orcJob._id), taskId: null },
-      { jobId: `push:${orcJob._id}:legacy` },
+      { jobId: `push-${orcJob._id}-legacy` },
     );
   }
 
@@ -348,11 +401,15 @@ const processor = async (bullJob) => {
     filesBlocked: writeErrors.length,
     diffStats,
   };
+
+  } finally {
+    await releaseRepoLock(lockKey, lockId);
+  }
 };
 
 const worker = new Worker("codegen", processor, {
   connection: getRedis(),
-  concurrency: 1, // serialized per repo — only one code-gen at a time
+  concurrency: 5, // up to 5 tasks in parallel; per-repo Redis lock serializes within each repo
 });
 
 worker.on("failed", async (bullJob, err) => {
@@ -360,8 +417,11 @@ worker.on("failed", async (bullJob, err) => {
   console.error(`[codegen-worker] failed job=${jobId}:`, err.message);
   if (jobId) {
     try {
-      const cloneDir = cloneDirForJob(jobId);
-      await cleanupClone(cloneDir);
+      // Find and clean up the per-task clone dir (best-effort)
+      const taskDoc = pmsTaskId ? await Task.findOne({ jobId, pmsTaskId }) : null;
+      if (taskDoc?.clonePath) {
+        await cleanupClone(taskDoc.clonePath).catch(() => {});
+      }
 
       await Job.findByIdAndUpdate(jobId, {
         status: "failed",

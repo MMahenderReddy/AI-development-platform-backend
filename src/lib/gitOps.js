@@ -14,9 +14,14 @@ import config from "../config/env.js";
 export const BOT_NAME = "AI Orchestrator Bot";
 export const BOT_EMAIL = "ai-orchestrator[bot]@users.noreply.github.com";
 
-/** Returns the persistent clone directory path for a given job ID */
+/** Returns the persistent clone directory path for a given job ID (legacy — one dir shared by all tasks) */
 export function cloneDirForJob(jobId) {
   return resolve(join(config.sandbox.workspaceDir, "clones", String(jobId)));
+}
+
+/** Returns the clone directory path isolated per task — prevents tasks of the same job colliding */
+export function cloneDirForTask(jobId, taskId) {
+  return resolve(join(config.sandbox.workspaceDir, "clones", String(jobId), String(taskId)));
 }
 
 /**

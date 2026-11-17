@@ -69,7 +69,7 @@ const processor = async (bullJob) => {
 
   if (!project?.deployConfig?.enabled || project.deployConfig.provider === "none") {
     console.log(`[deploy-worker] deploy not configured for job=${jobId} — marking done`);
-    await Job.findByIdAndUpdate(jobId, { status: "merged", stage: 10 });
+    await Job.findByIdAndUpdate(jobId, { status: "deployed", stage: 10 });
     await markTasksDone(orcJob);
     return { skipped: true };
   }
@@ -98,7 +98,7 @@ const processor = async (bullJob) => {
   await bullJob.updateProgress(80);
 
   // Mark job and project done
-  await Job.findByIdAndUpdate(jobId, { status: "merged", stage: 10 });
+  await Job.findByIdAndUpdate(jobId, { status: "deployed", stage: 10 });
 
   if (project) {
     await Project.findByIdAndUpdate(project._id, { status: "done", completionPct: 100 });

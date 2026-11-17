@@ -181,7 +181,7 @@ const processor = async (bullJob) => {
     await queues.push.add(
       "push-branch",
       { jobId: String(orcJob._id), taskId: String(taskId) },
-      { jobId: `push:${orcJob._id}:${taskId}` },
+      { jobId: `push-${orcJob._id}-${taskId}` },
     );
     console.log(`[quality-gate-worker] task=${taskId} passed — enqueued push`);
   } else {
@@ -213,7 +213,7 @@ const processor = async (bullJob) => {
       await queues.rework.add(
         "create-rework",
         { jobId: String(orcJob._id), taskId: String(taskId), reason: errorMsg, retryCount },
-        { jobId: `rework:${taskId}:${retryCount}` },
+        { jobId: `rework-${taskId}-${retryCount}` },
       );
       console.warn(`[quality-gate-worker] task=${taskId} FAILED (attempt ${retryCount}/${maxRetries}) — enqueued rework`);
     }

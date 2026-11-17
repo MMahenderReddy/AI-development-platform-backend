@@ -95,37 +95,57 @@ const processor = async (bullJob) => {
   let prNumber = null;
   let prUrl = null;
 
-  try {
-    const prTitle = task
-      ? `[AI] ${task.title.slice(0, 100)}`
-      : `[AI] Orchestrator job ${String(jobId).slice(-8)}`;
+  const prTitle = task
+    ? `[AI] ${task.title.slice(0, 100)}`
+    : `[AI] Orchestrator job ${String(jobId).slice(-8)}`;
 
-    const prBody = [
-      `AI-generated code from the AI Development Orchestrator.`,
-      ``,
-      `**Job:** \`${jobId}\``,
-      task ? `**Task:** ${task.title}` : "",
-      task?.taskArea ? `**Area:** ${task.taskArea}` : "",
-      ``,
-      `> This PR was opened automatically. The integration agent will review and merge.`,
-    ].filter(Boolean).join("\n");
+  const prBody = [
+    `AI-generated code from the AI Development Orchestrator.`,
+    ``,
+    `**Job:** \`${jobId}\``,
+    task ? `**Task:** ${task.title}` : "",
+    task?.taskArea ? `**Area:** ${task.taskArea}` : "",
+    ``,
+    `> This PR was opened automatically. The integration agent will review and merge.`,
+  ].filter(Boolean).join("\n");
 
-    const pr = await githubClient.createPull(repoFullName, {
-      branch: branchName,
-      base: prBase,
-      title: prTitle,
-      body: prBody,
-    });
-    prNumber = pr.number;
-    prUrl = pr.htmlUrl;
-    console.log(`[push-worker] created PR #${prNumber}: ${prUrl}`);
-  } catch (err) {
-    // PR may already exist (idempotent) — log and continue
-    if (err.status === 422) {
-      console.warn(`[push-worker] PR already exists for branch ${branchName}: ${err.message}`);
-    } else {
-      console.warn(`[push-worker] PR creation failed: ${err.message} — branch was pushed`);
+  // Try preferred base (integration), fall back to main if it doesn't exist
+  const baseCandidates = prBase !== baseBranch ? [prBase, baseBranch] : [baseBranch];
+
+  for (const candidate of baseCandidates) {
+    try {
+      const pr = await githubClient.createPull(repoFullName, {
+        branch: branchName,
+        base: candidate,
+        title: prTitle,
+        body: prBody,
+      });
+      prNumber = pr.number;
+      prUrl = pr.htmlUrl;
+      console.log(`[push-worker] created PR #${prNumber} → ${candidate}: ${prUrl}`);
+      break;
+    } catch (err) {
+      if (err.status === 422) {
+        // Could be: (a) base branch doesn't exist → try next candidate
+        //           (b) PR already open for this branch → look it up
+        const existing = await githubClient.findPullByBranch(repoFullName, branchName).catch(() => null);
+        if (existing) {
+          prNumber = existing.number;
+          prUrl = existing.htmlUrl;
+          console.log(`[push-worker] PR already open for branch ${branchName} — reused #${prNumber}: ${prUrl}`);
+          break;
+        }
+        // base branch probably doesn't exist — try next candidate
+        console.warn(`[push-worker] PR base "${candidate}" rejected (422) — trying next candidate`);
+      } else {
+        console.warn(`[push-worker] PR creation failed: ${err.message} — branch was pushed`);
+        break;
+      }
     }
+  }
+
+  if (!prNumber) {
+    console.warn(`[push-worker] could not create PR for branch ${branchName} — branch is on GitHub, open PR manually`);
   }
 
   await bullJob.updateProgress(70);
@@ -174,7 +194,7 @@ const processor = async (bullJob) => {
     await queues.integration.add(
       "run-integration",
       { jobId: String(orcJob._id) },
-      { jobId: `integration:${orcJob._id}` },
+      { jobId: `integration-${orcJob._id}` },
     );
     console.log(`[push-worker] all tasks pushed for job=${jobId} — enqueued integration`);
   }

@@ -15,6 +15,7 @@ const JOB_STATUSES = [
   "deploying",
   "pr_open",
   "merged",
+  "deployed",
   "failed",
   "cancelled",
   // legacy statuses kept for backward compat — no longer entered by autonomous flow
@@ -48,6 +49,7 @@ const jobSchema = new Schema(
     aiGeneratedTasks: [Schema.Types.Mixed],
     mode: { type: String, enum: ["pms", "standalone"], default: "pms" },
     lastHeartbeatAt: Date,
+    ciFailCount: { type: Number, default: 0 },  // consecutive CI failures on the integration PR
   },
   { timestamps: true },
 );

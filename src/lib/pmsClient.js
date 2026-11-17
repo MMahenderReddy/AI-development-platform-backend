@@ -17,7 +17,10 @@ const SESSION_TTL_S = 11 * 60 * 60; // 11h — PMS JWT is 12h, re-login 1h befor
 const pmsUrl = (path) => `${config.pms.apiUrl}${path}`;
 
 const rawRequest = async (method, path, { body, cookie } = {}) => {
-  const headers = { "Content-Type": "application/json" };
+  const headers = {
+    "Content-Type": "application/json",
+    "x-pms-workspace": "consultants",
+  };
   if (cookie) headers["Cookie"] = `pms_token=${cookie}`;
 
   const res = await fetch(pmsUrl(path), {
@@ -40,7 +43,8 @@ const rawRequest = async (method, path, { body, cookie } = {}) => {
 };
 
 const login = async () => {
-  const { email, password } = config.pms;
+  const email = config.pms.serviceEmail;
+  const password = config.pms.servicePassword;
   if (!email || !password) throw new Error("PMS service account credentials not configured (PMS_SERVICE_EMAIL / PMS_SERVICE_PASSWORD)");
 
   const res = await fetch(pmsUrl("/api/auth/login"), {
@@ -113,13 +117,13 @@ export const pmsClient = {
 
   /**
    * Create a PMS task as the orchestrator service account.
-   * reporter is set to "system" server-side — the PMS treats this as an automatic task.
+   * Uses /api/tasks/ai-create which: requires no assignee, sets reporter="system",
+   * and handles idempotency by source key to prevent duplicates on retry.
    */
   createTask: (input) =>
-    request("POST", "/api/tasks", {
+    request("POST", "/api/tasks/ai-create", {
       body: {
         ...input,
-        // source links back to the orchestrator job for traceability
         source: input.source ?? undefined,
       },
     }),
@@ -128,6 +132,52 @@ export const pmsClient = {
     request("POST", `/api/tasks/${encodeURIComponent(taskId)}/move`, { body: { to, reason } }),
 
   getTask: (taskId) => request("GET", `/api/tasks/${encodeURIComponent(taskId)}`),
+
+  /**
+   * Look up a task by its `source` string — the idempotency key the orchestrator stamps
+   * on every task it creates. Returns the task object if found, null if not.
+   * Uses the PMS task list endpoint filtered by source (best-effort — returns null on
+   * any error so callers fall through to creating the task instead).
+   */
+  getTaskBySource: async (sourceKey) => {
+    try {
+      const res = await request("GET", `/api/tasks?source=${encodeURIComponent(sourceKey)}&limit=1`);
+      const tasks = Array.isArray(res) ? res : (res?.tasks ?? res?.data ?? []);
+      return tasks.length > 0 ? tasks[0] : null;
+    } catch {
+      return null;
+    }
+  },
+
+  /**
+   * List all users visible to the service account in the current workspace.
+   * Returns an array of PMS user objects (with _id, name, email, role, title fields).
+   */
+  listUsers: () => request("GET", "/api/users"),
+
+  /**
+   * Fetch the members of a specific PMS project.
+   * Returns the project object (which has a `members` array of user IDs).
+   */
+  getProjectMembers: async (projectId) => {
+    const proj = await request("GET", `/api/projects/${encodeURIComponent(projectId)}`);
+    if (!proj?.members?.length) return [];
+    // Fetch all workspace users, then filter to project members.
+    // PMS REST API serialises the user id as `id` (not `_id`), so check both.
+    const allUsers = await request("GET", "/api/users");
+    const memberSet = new Set(proj.members.map(String));
+    return (Array.isArray(allUsers) ? allUsers : []).filter((u) =>
+      memberSet.has(String(u.id ?? u._id)),
+    );
+  },
+
+  /**
+   * Partial-update a PMS task (assignee, title, description, priority, due, points).
+   * taskId is the PMS task _id string (e.g. "TEST-12").
+   * patch is a plain object with the fields to change.
+   */
+  updateTask: (taskId, patch) =>
+    request("PATCH", `/api/tasks/${encodeURIComponent(taskId)}`, { body: patch }),
 
   // ── Pull Requests ─────────────────────────────────────────────────────────
 

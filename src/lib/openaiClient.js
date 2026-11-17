@@ -103,7 +103,7 @@ export const extractRequirementsFromChunk = async (text, chunkIndex = 0, idOffse
   const toolCall = response.choices[0]?.message?.tool_calls?.[0];
   if (!toolCall) {
     console.warn(`[openai] no tool call returned for chunk ${chunkIndex}`);
-    return [];
+    return { requirements: [], usage: response.usage ?? null };
   }
 
   let parsed;
@@ -111,16 +111,19 @@ export const extractRequirementsFromChunk = async (text, chunkIndex = 0, idOffse
     parsed = JSON.parse(toolCall.function.arguments);
   } catch (err) {
     console.error(`[openai] failed to parse tool call arguments for chunk ${chunkIndex}:`, err.message);
-    return [];
+    return { requirements: [], usage: response.usage ?? null };
   }
 
   const requirements = parsed.requirements ?? [];
 
   // Re-number IDs to avoid conflicts when merging chunks
-  return requirements.map((r, i) => ({
-    ...r,
-    id: `REQ-${String(idOffset + i + 1).padStart(3, "0")}`,
-  }));
+  return {
+    requirements: requirements.map((r, i) => ({
+      ...r,
+      id: `REQ-${String(idOffset + i + 1).padStart(3, "0")}`,
+    })),
+    usage: response.usage ?? null,
+  };
 };
 
 // ── Task generation schema ────────────────────────────────────────────────────
@@ -166,6 +169,10 @@ const GENERATE_TASKS_TOOL = {
                 type: "string",
                 enum: ["frontend", "backend", "fullstack"],
                 description: "Which part of the codebase this task belongs to: frontend (UI/UX), backend (API/server/DB), or fullstack (both)",
+              },
+              estimatedHours: {
+                type: "number",
+                description: "Estimated hours to complete this task (e.g. 2, 4, 8, 16)",
               },
             },
           },
@@ -314,12 +321,12 @@ export const generateTasksFromRequirements = async (requirements) => {
   });
 
   const toolCall = response.choices[0]?.message?.tool_calls?.[0];
-  if (!toolCall) return [];
+  if (!toolCall) return { tasks: [], usage: response.usage ?? null };
 
   try {
     const parsed = JSON.parse(toolCall.function.arguments);
-    return parsed.tasks ?? [];
+    return { tasks: parsed.tasks ?? [], usage: response.usage ?? null };
   } catch {
-    return [];
+    return { tasks: [], usage: response.usage ?? null };
   }
 };

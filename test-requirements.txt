@@ -1,0 +1,14 @@
+Project: Testing Application
+Version: 1.0
+
+Requirements:
+
+1. Add a user profile page that shows the user's name, email, and avatar.
+
+2. Add a dark mode toggle button in the navigation bar that switches the app between light and dark themes and remembers the user's preference.
+
+3. Add a notification badge on the bell icon that shows the count of unread notifications.
+
+4. Fix the bug where the logout button does not redirect the user to the login page after signing out.
+
+5. Add a search bar to the task list page that filters tasks by title in real time as the user types.

@@ -325,7 +325,7 @@ const processor = async (bullJob) => {
       await queues.rework.add(
         "create-rework",
         { jobId: String(orcJob._id), taskId: String(task._id), reason, retryCount },
-        { jobId: `rework:${task._id}:${retryCount}` },
+        { jobId: `rework-${task._id}-${retryCount}` },
       );
       reworkTaskIds.push(String(task._id));
     }

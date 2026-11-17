@@ -5,3 +5,6 @@ workspaces/
 uploads/
 dist/
 *.log
+
+# Project documents — added manually by admin, not committed to source control
+projects/*/

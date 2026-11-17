@@ -17,7 +17,7 @@ router.get("/projects", requireAuth, async (req, res, next) => {
     const withRepo = (Array.isArray(projects) ? projects : projects.projects ?? [])
       .filter((p) => p.repo && !p.archived)
       .map((p) => ({
-        id: p._id,
+        id: p.id ?? p._id,
         name: p.name,
         key: p.key,
         repo: p.repo,

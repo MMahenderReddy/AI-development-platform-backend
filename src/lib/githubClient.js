@@ -158,6 +158,19 @@ export const githubClient = {
       title: p.title,
     })),
 
+  /**
+   * Find the first open PR whose head matches the given branch.
+   * Returns { number, htmlUrl } or null if none found.
+   * Used to recover the PR number when createPull returns 422 (PR already exists).
+   */
+  findPullByBranch: async (fullName, branch) => {
+    const [owner] = fullName.split("/");
+    const list = await ghRequest("GET", `/repos/${fullName}/pulls?state=open&head=${enc(owner)}:${enc(branch)}&per_page=5`);
+    if (!Array.isArray(list) || list.length === 0) return null;
+    const p = list[0];
+    return { number: p.number, htmlUrl: p.html_url };
+  },
+
   /** Get pull request status. */
   getPull: (fullName, number) =>
     ghRequest("GET", `/repos/${fullName}/pulls/${number}`).then((p) => ({
@@ -176,4 +189,51 @@ export const githubClient = {
         submittedAt: r.submitted_at,
       })),
     ),
+
+  /**
+   * Get all check runs for a commit SHA.
+   * Returns { allPassed, anyFailed, pending, runs[] }
+   * allPassed = every run completed successfully (or was skipped/neutral)
+   * anyFailed = at least one run failed/cancelled/timed_out/action_required
+   * pending   = at least one run is still queued/in_progress (and none failed)
+   */
+  getCheckRuns: async (fullName, ref) => {
+    let runs = [];
+    let page = 1;
+    while (true) {
+      const data = await ghRequest("GET", `/repos/${fullName}/commits/${enc(ref)}/check-runs?per_page=100&page=${page}`);
+      const batch = data.check_runs ?? [];
+      runs.push(...batch);
+      if (batch.length < 100) break;
+      page++;
+    }
+    if (runs.length === 0) return { allPassed: true, anyFailed: false, pending: false, runs: [] };
+    const FAIL_CONCLUSIONS = new Set(["failure", "cancelled", "timed_out", "action_required"]);
+    const PASS_CONCLUSIONS = new Set(["success", "neutral", "skipped"]);
+    const anyFailed = runs.some((r) => r.status === "completed" && FAIL_CONCLUSIONS.has(r.conclusion));
+    const pending   = runs.some((r) => r.status !== "completed");
+    const allPassed = !anyFailed && !pending && runs.every((r) => PASS_CONCLUSIONS.has(r.conclusion));
+    return {
+      allPassed,
+      anyFailed,
+      pending,
+      runs: runs.map((r) => ({ name: r.name, status: r.status, conclusion: r.conclusion })),
+    };
+  },
+
+  /**
+   * Merge a pull request.
+   * mergeMethod: "squash" (default) | "merge" | "rebase"
+   * Returns { merged, sha, message }
+   */
+  mergePull: (fullName, number, { mergeMethod = "squash", commitTitle, commitMessage } = {}) =>
+    ghRequest("PUT", `/repos/${fullName}/pulls/${number}/merge`, {
+      merge_method: mergeMethod,
+      ...(commitTitle  ? { commit_title:   commitTitle }  : {}),
+      ...(commitMessage ? { commit_message: commitMessage } : {}),
+    }).then((r) => ({
+      merged:  r.merged ?? true,
+      sha:     r.sha,
+      message: r.message,
+    })),
 };
