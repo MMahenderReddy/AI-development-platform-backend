@@ -8,7 +8,6 @@
  */
 import { Router } from "express";
 import Task from "../models/Task.js";
-import OrchestratorUser from "../models/OrchestratorUser.js";
 import Approval from "../models/Approval.js";
 import Job from "../models/Job.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
@@ -41,7 +40,6 @@ router.get("/", requireAuth, async (req, res, next) => {
     const filter = jobId ? { jobId } : {};
     const tasks = await Task.find(filter)
       .sort({ createdAt: 1 })
-      .populate("assignedTo", "name email role")
       .lean();
     res.json(tasks);
   } catch (err) {
@@ -52,9 +50,7 @@ router.get("/", requireAuth, async (req, res, next) => {
 // ── Get one task ──────────────────────────────────────────────────────────────
 router.get("/:id", requireAuth, async (req, res, next) => {
   try {
-    const task = await Task.findById(req.params.id)
-      .populate("assignedTo", "name email role")
-      .lean();
+    const task = await Task.findById(req.params.id).lean();
     if (!task) throw notFound("Task");
     res.json(task);
   } catch (err) {
@@ -66,7 +62,7 @@ router.get("/:id", requireAuth, async (req, res, next) => {
 router.patch("/:id/reassign", requireAuth, requireRole("admin", "manager", "lead"), async (req, res, next) => {
   try {
     const { assignedTo } = req.body ?? {};
-    if (!assignedTo) throw badRequest("assignedTo (userId) is required");
+    if (!assignedTo || typeof assignedTo !== "string") throw badRequest("assignedTo (pmsUserId) is required");
 
     const task = await Task.findById(req.params.id);
     if (!task) throw notFound("Task");
@@ -76,13 +72,8 @@ router.patch("/:id/reassign", requireAuth, requireRole("admin", "manager", "lead
       throw badRequest(`Cannot reassign task in status: ${task.status}`);
     }
 
-    const member = await OrchestratorUser.findById(assignedTo).select("-passwordHash");
-    if (!member) throw notFound("User");
-    if (member.status !== "active") throw badRequest("Cannot assign to a disabled user");
-
     const previousAssignee = task.assignedTo;
-
-    task.assignedTo = member._id;
+    task.assignedTo = String(assignedTo);
     task.status = "assigned";
     await task.save();
 
@@ -91,7 +82,7 @@ router.patch("/:id/reassign", requireAuth, requireRole("admin", "manager", "lead
         taskId: task._id,
         taskTitle: task.title,
         from: previousAssignee,
-        to: member._id,
+        to: assignedTo,
       },
     });
 

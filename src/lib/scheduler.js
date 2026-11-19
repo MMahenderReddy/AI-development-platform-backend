@@ -22,7 +22,6 @@
  *  task appears assigned in the PMS UI. This requires the orchestrator
  *  user's email to match a PMS user who is a project member.
  */
-import OrchestratorUser from "../models/OrchestratorUser.js";
 import Task from "../models/Task.js";
 import Job from "../models/Job.js";
 import { getQueues } from "./queues.js";
@@ -204,19 +203,34 @@ export async function scheduleTasks(jobId) {
     console.log(`[scheduler]   • [${t.pmsTaskId}] "${t.title}" | priority=${t.priority} area=${t.taskArea} type=${t.type}`);
   }
 
-  // ── Step 2: Load active orchestrator team members for this workspace ────
-  const members = await OrchestratorUser.find({
-    status: "active",
-    pmsWorkspace: orcJob.pmsWorkspace ?? "core",
-  }).lean();
-  console.log(`\n[scheduler] STEP 2 — Active orchestrator team members: ${members.length}`);
-  if (members.length === 0) {
-    console.warn(`[scheduler] ⚠ No active members — cannot auto-assign. Falling back to awaiting_assignment.`);
+  // ── Step 2: Load PMS project members for assignment ─────────────────────
+  const rawPmsMembers = await fetchPmsProjectMembers(orcJob.pmsProjectId, orcJob.pmsWorkspace ?? "core");
+  console.log(`\n[scheduler] STEP 2 — PMS project members available for assignment: ${rawPmsMembers.length}`);
+  if (rawPmsMembers.length === 0) {
+    console.warn(`[scheduler] ⚠ No PMS project members found — cannot auto-assign. Add members to the PMS project.`);
     console.log(`${sep}\n`);
     return { assigned: 0, dispatched: 0 };
   }
+
+  // Compute active task count from Task collection for each PMS member
+  const activeTaskStatuses = ["assigned", "queued", "generating", "quality_gate", "pushed", "pr_open"];
+  const activeCounts = {};
+  for (const m of rawPmsMembers) {
+    const cnt = await Task.countDocuments({
+      assignedTo: String(m._id),
+      status: { $in: activeTaskStatuses },
+    });
+    activeCounts[String(m._id)] = cnt;
+  }
+
+  const members = rawPmsMembers.map((m) => ({
+    ...m,
+    capability: m._capability ?? "fullstack",
+    skills: [],
+    activeTaskCount: activeCounts[String(m._id)] ?? 0,
+  }));
   for (const m of members) {
-    console.log(`[scheduler]   • ${m.name} <${m.email}> | role=${m.role} capability=${m.capability ?? "fullstack"} skills=[${(m.skills ?? []).join(", ")}] activeTaskCount=${m.activeTaskCount ?? 0}`);
+    console.log(`[scheduler]   • ${m.name} <${m.email ?? "no email"}> | capability=${m.capability} activeTaskCount=${m.activeTaskCount}`);
   }
 
   // ── Step 3: Topological sort + pick assignments ──────────────────────────
@@ -262,15 +276,7 @@ export async function scheduleTasks(jobId) {
     return { assigned: 0, dispatched: 0 };
   }
 
-  // ── Step 4: Fetch PMS project members for PMS assignee sync ─────────────
-  console.log(`\n[scheduler] STEP 4 — Fetching PMS project members for assignee sync`);
-  const pmsMembers = await fetchPmsProjectMembers(orcJob.pmsProjectId, orcJob.pmsWorkspace ?? "core");
-  const pmsCounts = Object.fromEntries(pmsMembers.map((m) => [String(m._id), 0]));
-
-  if (pmsMembers.length === 0) {
-    console.warn(`[scheduler]   ⚠ No PMS project members found — PMS assignee sync will be skipped`);
-    console.warn(`[scheduler]     Fix: add team members to the TEST project in PMS, then re-run`);
-  }
+  // ── Step 4: PMS assignee sync uses the same members already fetched in Step 2 ─
 
   // ── Step 5: Compute scheduledDate / dueDate for each assignment ──────────
   console.log(`\n[scheduler] STEP 5 — Computing daily schedule (max ${MAX_TASKS_PER_MEMBER_PER_DAY} tasks/member/day)`);
@@ -348,38 +354,27 @@ export async function scheduleTasks(jobId) {
     const isToday = isSameDay(task._scheduledDate, today);
     const delay = isToday ? i * staggerMs : 0; // stagger only today's dispatches
 
-    // Persist in orchestrator DB
+    // Persist in orchestrator DB — assignedTo stores pmsUserId string
     await Task.findByIdAndUpdate(task._id, {
       status: isToday ? "queued" : "assigned",
-      assignedTo: memberId,
+      assignedTo: memberId, // pmsUserId string
       scheduledDate: task._scheduledDate,
       dueDate: task._dueDate,
     });
 
-    if (isToday) {
-      await OrchestratorUser.findByIdAndUpdate(memberId, {
-        $inc: { activeTaskCount: 1 },
-      });
-    }
-
-    // Sync assignee to PMS using the actual PMS project members
+    // Sync assignee to PMS (member IS the PMS member — use same ID)
     let pmsAssignResult = "SKIPPED";
-    if (pmsMembers.length > 0) {
-      const pmsMember = pickPmsMember(task, pmsMembers, pmsCounts);
-      if (pmsMember) {
-        try {
-          const pmsUpdate = {
-            assignee: String(pmsMember._id),
-            ...(task._dueDate ? { dueDate: task._dueDate.toISOString() } : {}),
-          };
-          await pmsClient.updateTask(task.pmsTaskId, pmsUpdate);
-          pmsCounts[String(pmsMember._id)] = (pmsCounts[String(pmsMember._id)] ?? 0) + 1;
-          pmsAssignResult = `SUCCESS → ${pmsMember.name} (${pmsMember._id}) capability=${pmsMember._capability}`;
-          console.log(`[scheduler]   [${task.pmsTaskId}] PMS assignee set → ${pmsMember.name} ✓`);
-        } catch (err) {
-          pmsAssignResult = `FAILED: ${err.message}`;
-          console.warn(`[scheduler]   [${task.pmsTaskId}] PMS assignee update failed: ${err.message}`);
-        }
+    if (task.pmsTaskId) {
+      try {
+        await pmsClient.updateTask(task.pmsTaskId, {
+          assignee: memberId,
+          ...(task._dueDate ? { dueDate: task._dueDate.toISOString() } : {}),
+        });
+        pmsAssignResult = `SUCCESS → ${member.name} (${memberId})`;
+        console.log(`[scheduler]   [${task.pmsTaskId}] PMS assignee set → ${member.name} ✓`);
+      } catch (err) {
+        pmsAssignResult = `FAILED: ${err.message}`;
+        console.warn(`[scheduler]   [${task.pmsTaskId}] PMS assignee update failed: ${err.message}`);
       }
     }
 
@@ -448,12 +443,6 @@ export async function scheduleTasks(jobId) {
   console.log(`  Dispatched to codegen today:            ${dispatchedToday}`);
   console.log(`  Scheduled for future days:              ${scheduledFuture}`);
   console.log(`  PMS assignee sync — SUCCESS: ${pmsSuccessCount}  FAILED: ${pmsFailCount}  SKIPPED: ${pmsSkipCount}`);
-
-  if (pmsSkipCount > 0) {
-    console.log(`\n  ℹ  PMS sync was skipped for ${pmsSkipCount} task(s) because the orchestrator user's email`);
-    console.log(`     was not found in the PMS user list for this workspace.`);
-    console.log(`     To fix: add each orchestrator user to the PMS (same email) and add them to the project.`);
-  }
 
   console.log(`${sep}\n`);
 

@@ -8,8 +8,8 @@ const repoMappingSchema = new Schema(
     baseBranch:       { type: String, default: "main" },
     branchPattern:    { type: String, default: "orch/{taskId}/{slug}" }, // {taskId}, {slug}, {memberId}
     // when set, overrides skills-based assignment for this repo type
-    assignedMemberId: { type: Schema.Types.ObjectId, ref: "OrchestratorUser" },
-    createdBy:        { type: Schema.Types.ObjectId, ref: "OrchestratorUser", required: true },
+    assignedMemberId: String,
+    createdBy:        { type: String, default: "system" },
   },
   { timestamps: true },
 );

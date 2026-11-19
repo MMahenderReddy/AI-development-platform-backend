@@ -32,6 +32,7 @@ export default {
 
   jwtSecret,
   jwtExpiresIn: optional("JWT_EXPIRES_IN", "8h"),
+  s2sKey: optional("ORCHESTRATOR_S2S_KEY", ""),
 
   corsOrigins: optional("CORS_ORIGIN", "http://localhost:3416").split(",").map((s) => s.trim()),
 

@@ -1,16 +1,16 @@
-import jwt from "jsonwebtoken";
 import config from "../config/env.js";
-import OrchestratorUser from "../models/OrchestratorUser.js";
 import { unauthorized, forbidden } from "../lib/errors.js";
 
-export const requireAuth = async (req, res, next) => {
+export const requireAuth = (req, res, next) => {
   try {
-    const token = req.cookies?.orch_token;
-    if (!token) throw unauthorized();
-    const payload = jwt.verify(token, config.jwtSecret);
-    const user = await OrchestratorUser.findById(payload.sub);
-    if (!user || user.status !== "active") throw unauthorized("Session invalid");
-    req.user = user;
+    if (!config.s2sKey) {
+      return next(new Error("ORCHESTRATOR_S2S_KEY not configured"));
+    }
+    const auth = req.headers.authorization ?? "";
+    if (!auth.startsWith("Bearer ")) throw unauthorized();
+    const key = auth.slice(7);
+    if (!key || key !== config.s2sKey) throw unauthorized();
+    req.user = { _id: "system", name: "orchestrator-service", role: "admin" };
     next();
   } catch (err) {
     next(err.name === "ApiError" ? err : unauthorized());

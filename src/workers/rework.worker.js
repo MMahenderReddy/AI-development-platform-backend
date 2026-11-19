@@ -21,7 +21,6 @@ import { getRedis } from "../lib/redis.js";
 import { connectDb } from "../lib/db.js";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
-import OrchestratorUser from "../models/OrchestratorUser.js";
 import { pmsClientFor } from "../lib/pmsClient.js";
 import { audit } from "../lib/audit.js";
 import { getQueues } from "../lib/queues.js";
@@ -89,20 +88,17 @@ const processor = async (bullJob) => {
 
   await bullJob.updateProgress(50);
 
-  // Find the best assignee (same developer or fallback by capability)
-  let assignedTo = originalTask.assignedTo;
-  if (!assignedTo) {
-    const members = await OrchestratorUser.find({
-      status: "active",
-      pmsWorkspace: orcJob.pmsWorkspace ?? "core",
-    }).lean();
-    const area = originalTask.taskArea ?? "fullstack";
-    const capMap = { frontend: ["frontend", "fullstack"], backend: ["backend", "fullstack"], fullstack: ["fullstack", "lead"] };
-    const eligible = members.filter((m) => (capMap[area] ?? ["fullstack"]).includes(m.capability ?? "fullstack"));
-    if (eligible.length > 0) {
-      assignedTo = eligible.reduce((best, m) =>
-        (m.activeTaskCount ?? 0) < (best.activeTaskCount ?? 0) ? m : best,
-      )._id;
+  // Find the best assignee — keep original or pick from PMS project members
+  let assignedTo = originalTask.assignedTo; // pmsUserId string
+  if (!assignedTo && orcJob.pmsProjectId) {
+    try {
+      const client = pmsClientFor(orcJob.pmsWorkspace ?? "core");
+      const pmsMembers = await client.getProjectMembers(orcJob.pmsProjectId);
+      if (Array.isArray(pmsMembers) && pmsMembers.length > 0) {
+        assignedTo = String(pmsMembers[0].id ?? pmsMembers[0]._id);
+      }
+    } catch (e) {
+      console.warn(`[rework-worker] could not fetch PMS members for fallback assignment: ${e.message}`);
     }
   }
 
@@ -124,10 +120,6 @@ const processor = async (bullJob) => {
     assignedTo: assignedTo ?? undefined,
     status: assignedTo ? "queued" : "pending",
   });
-
-  if (assignedTo) {
-    await OrchestratorUser.findByIdAndUpdate(assignedTo, { $inc: { activeTaskCount: 1 } });
-  }
 
   await bullJob.updateProgress(75);
 

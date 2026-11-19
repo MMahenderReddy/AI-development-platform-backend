@@ -6,7 +6,6 @@
  * The code-exchange helpers (exchangeCode, getGitHubUser, …) run during the
  * orchestrator's OAuth callback before the tokens are forwarded to PMS.
  */
-import OrchestratorUser from "../models/OrchestratorUser.js";
 import { pmsClient } from "./pmsClient.js";
 
 const GH_TOKEN_URL = "https://github.com/login/oauth/access_token";
@@ -96,20 +95,11 @@ export async function checkRepoPermission(accessToken, fullName) {
 
 // ── Resolve a valid access token for a member (fetched from PMS) ─────────────
 
-export async function resolveUserToken(orchestratorUserId) {
-  const user = await OrchestratorUser.findById(orchestratorUserId)
-    .select("pmsUserId name")
-    .lean();
-
-  if (!user?.pmsUserId) {
-    throw new Error(
-      `Member has no PMS user ID — cannot retrieve GitHub credentials. ` +
-      `Ensure the orchestrator user has a pmsUserId set.`,
-    );
-  }
+export async function resolveUserToken(pmsUserId) {
+  if (!pmsUserId) throw new Error("No pmsUserId provided — cannot retrieve GitHub credentials.");
 
   // PMS handles decryption and auto-refresh; throws if not connected.
-  const result = await pmsClient.getGithubToken(user.pmsUserId);
+  const result = await pmsClient.getGithubToken(pmsUserId);
   if (!result?.accessToken) {
     throw new Error(
       `Member has not connected their GitHub account. ` +

@@ -16,7 +16,6 @@ import { getRedis } from "../lib/redis.js";
 import { connectDb } from "../lib/db.js";
 import Task from "../models/Task.js";
 import Job from "../models/Job.js";
-import OrchestratorUser from "../models/OrchestratorUser.js";
 import { getQueues } from "../lib/queues.js";
 import { audit } from "../lib/audit.js";
 
@@ -102,7 +101,6 @@ const processor = async (bullJob) => {
 
     // Dispatch to codegen
     await Task.findByIdAndUpdate(task._id, { status: "queued" });
-    await OrchestratorUser.findByIdAndUpdate(task.assignedTo, { $inc: { activeTaskCount: 1 } });
 
     const delay = dispatched * staggerMs;
     await queues.codegen.add(

@@ -42,8 +42,8 @@ const taskSchema = new Schema(
 
     status:        { type: String, enum: TASK_STATUSES, default: "pending", index: true },
 
-    // assignment (Phase 2 auto-assign fills this; Phase 1 manual start-codegen leaves null)
-    assignedTo:    { type: Schema.Types.ObjectId, ref: "OrchestratorUser", index: true },
+    // assignment — stores pmsUserId string (Phase 2 auto-assign fills this)
+    assignedTo:    { type: String, index: true },
 
     // repo resolution (Phase 2 reads from RepoMapping; Phase 1 copies from Job)
     repoFullName:  String,
@@ -58,7 +58,7 @@ const taskSchema = new Schema(
 
     // set when quality gate is bypassed by an admin/manager
     qualityOverride: {
-      by:     { type: Schema.Types.ObjectId, ref: "OrchestratorUser" },
+      by:     String,
       reason: String,
       at:     Date,
     },

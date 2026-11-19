@@ -19,8 +19,8 @@ import { getRedis } from "../lib/redis.js";
 import { connectDb } from "../lib/db.js";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
-import OrchestratorUser from "../models/OrchestratorUser.js";
 import RepoMapping from "../models/RepoMapping.js";
+import { pmsClientFor } from "../lib/pmsClient.js";
 import { scheduleTasks } from "../lib/scheduler.js";
 import { audit } from "../lib/audit.js";
 
@@ -62,19 +62,21 @@ const processor = async (bullJob) => {
     console.log(`[task-assign-worker]   • [${t.pmsTaskId}] "${t.title}" | ${t.priority} | ${t.taskArea} | ${t.type}`);
   }
 
-  // ── Step 2: Show active team members for this workspace ──────────────────
-  const activeMembers = await OrchestratorUser.find({
-    status: "active",
-    pmsWorkspace: orcJob.pmsWorkspace ?? "core",
-  }).lean();
-  console.log(`\n[task-assign-worker] STEP 2 — Active orchestrator team members: ${activeMembers.length}`);
-  if (activeMembers.length === 0) {
-    console.warn(`[task-assign-worker] ⚠ No active team members! Add members via the Team page.`);
+  // ── Step 2: Show PMS project members available for assignment ────────────
+  let pmsMembers = [];
+  try {
+    const client = pmsClientFor(orcJob.pmsWorkspace ?? "core");
+    pmsMembers = orcJob.pmsProjectId ? await client.getProjectMembers(orcJob.pmsProjectId) : await client.listUsers();
+    pmsMembers = Array.isArray(pmsMembers) ? pmsMembers : [];
+  } catch (e) {
+    console.warn(`[task-assign-worker] could not fetch PMS members: ${e.message}`);
   }
-  for (const m of activeMembers) {
-    console.log(`[task-assign-worker]   • ${m.name} <${m.email}>`);
-    console.log(`[task-assign-worker]     role=${m.role} capability=${m.capability ?? "fullstack"} skills=[${(m.skills ?? []).join(", ")}]`);
-    console.log(`[task-assign-worker]     currentActiveTaskCount=${m.activeTaskCount ?? 0}`);
+  console.log(`\n[task-assign-worker] STEP 2 — PMS project members: ${pmsMembers.length}`);
+  if (pmsMembers.length === 0) {
+    console.warn(`[task-assign-worker] ⚠ No PMS project members found! Add members to the PMS project.`);
+  }
+  for (const m of pmsMembers) {
+    console.log(`[task-assign-worker]   • ${m.name} <${m.email ?? "no email"}>`);
   }
 
   // ── Step 3: Resolve per-task repo mappings ────────────────────────────────
@@ -134,15 +136,13 @@ const processor = async (bullJob) => {
   const unassigned = allTasks.filter((t) => !t.assignedTo);
   const withDue = allTasks.filter((t) => t.estimatedHours);
 
-  // Build assignee map for display
-  const memberIds = [...new Set(assigned.map((t) => String(t.assignedTo)))];
-  const memberDocs = await OrchestratorUser.find({ _id: { $in: memberIds } }, { name: 1, email: 1 }).lean();
-  const memberById = Object.fromEntries(memberDocs.map((m) => [String(m._id), m]));
+  // Build assignee map for display (task.assignedTo is pmsUserId string)
+  const pmsMemberById = Object.fromEntries(pmsMembers.map((m) => [String(m.id ?? m._id), m]));
 
   const byMember = {};
   for (const t of assigned) {
-    const m = memberById[String(t.assignedTo)];
-    const key = m ? `${m.name} <${m.email}>` : `Unknown (${t.assignedTo})`;
+    const m = pmsMemberById[String(t.assignedTo)];
+    const key = m ? `${m.name} <${m.email ?? "no email"}>` : `Unknown (${t.assignedTo})`;
     if (!byMember[key]) byMember[key] = [];
     byMember[key].push(t);
   }

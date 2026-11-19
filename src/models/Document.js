@@ -7,7 +7,7 @@ const requirementSchema = new Schema(
     editedText: String,
     approved: { type: Boolean, default: false },
     rejected: { type: Boolean, default: false },
-    approvedBy: Schema.Types.ObjectId,
+    approvedBy: String,
     approvedAt: Date,
   },
   { _id: false },
@@ -25,7 +25,7 @@ const docSchema = new Schema(
     extractedText: String,
     chunked: { type: Boolean, default: false },
     requirements: [requirementSchema],
-    uploadedBy: { type: Schema.Types.ObjectId, ref: "OrchestratorUser" },
+    uploadedBy: String,
     // version history — links to the document this one was compared against
     previousDocumentId: { type: Schema.Types.ObjectId, ref: "Document", default: undefined },
     documentVersion:    { type: Number, default: 1 },

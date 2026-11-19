@@ -6,7 +6,7 @@ const approvalSchema = new Schema(
     stage: { type: Number, required: true, min: 1, max: 10 },
     stageName: String,
     decision: { type: String, enum: ["approved", "rejected", "edited"], required: true },
-    approvedBy: { type: Schema.Types.ObjectId, ref: "OrchestratorUser", required: true },
+    approvedBy: { type: String, required: true },
     approvedAt: { type: Date, default: Date.now },
     notes: String,
     payload: Schema.Types.Mixed,

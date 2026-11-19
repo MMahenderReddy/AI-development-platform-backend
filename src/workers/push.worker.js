@@ -22,12 +22,11 @@ import { connectDb } from "../lib/db.js";
 import { simpleGit } from "simple-git";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
-import OrchestratorUser from "../models/OrchestratorUser.js";
 import { githubClient, githubUserClient } from "../lib/githubClient.js";
 import { resolveUserToken } from "../lib/githubOAuth.js";
 import config from "../config/env.js";
 import { pushBranch, BOT_NAME, BOT_EMAIL } from "../lib/gitOps.js";
-import { pmsClientFor } from "../lib/pmsClient.js";
+import { pmsClientFor, pmsClient } from "../lib/pmsClient.js";
 import { audit } from "../lib/audit.js";
 import { getQueues } from "../lib/queues.js";
 import { existsSync } from "fs";
@@ -80,12 +79,11 @@ const processor = async (bullJob) => {
   let memberToken = null;
   let memberGitHubLogin = null;
   if (task?.assignedTo) {
+    const pmsUserId = String(task.assignedTo);
     try {
-      memberToken = await resolveUserToken(String(task.assignedTo));
-      const assignee = await OrchestratorUser.findById(task.assignedTo)
-        .select("githubAuth.githubLogin githubAuth.githubEmail name")
-        .lean();
-      memberGitHubLogin = assignee?.githubAuth?.githubLogin ?? null;
+      memberToken = await resolveUserToken(pmsUserId);
+      const ghStatus = await pmsClient.getGithubStatus(pmsUserId).catch(() => null);
+      memberGitHubLogin = ghStatus?.githubLogin ?? null;
       console.log(`[push-worker] using GitHub account @${memberGitHubLogin ?? "?"} for push`);
     } catch (err) {
       console.warn(`[push-worker] member GitHub token unavailable (${err.message}), falling back to GitHub App token`);

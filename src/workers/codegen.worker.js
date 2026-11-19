@@ -62,7 +62,6 @@ import { resolveUserToken } from "../lib/githubOAuth.js";
 import config from "../config/env.js";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
-import OrchestratorUser from "../models/OrchestratorUser.js";
 
 await connectDb();
 
@@ -177,25 +176,26 @@ const processor = async (bullJob) => {
   let memberAuthorEmail = BOT_EMAIL;
 
   if (taskDoc?.assignedTo) {
-    const assignee = await OrchestratorUser.findById(taskDoc.assignedTo)
-      .select("name githubAuth.githubLogin githubAuth.githubEmail githubAuth.connectedAt")
-      .lean();
-
-    if (assignee?.name) {
-      memberSlug = toBranchSlug(assignee.name.split(" ")[0]);
-    }
-
-    // resolveUserToken throws if not connected or pmsUserId not set — fall back to bot identity
+    const pmsUserId = String(taskDoc.assignedTo);
     try {
-      memberToken = await resolveUserToken(String(taskDoc.assignedTo));
-      memberAuthorName = assignee?.name ?? BOT_NAME;
-      memberAuthorEmail = assignee?.githubAuth?.githubEmail ?? BOT_EMAIL;
-      console.log(`[codegen-worker] using GitHub account @${assignee?.githubAuth?.githubLogin ?? "?"} for member "${assignee?.name}"`);
+      // Fetch member info from PMS
+      const pmsUserList = await pmsClient.listUsers();
+      const pmsUser = (Array.isArray(pmsUserList) ? pmsUserList : []).find(
+        (u) => String(u.id ?? u._id) === pmsUserId
+      );
+      if (pmsUser?.name) {
+        memberSlug = toBranchSlug(pmsUser.name.split(" ")[0]);
+        memberAuthorName = pmsUser.name;
+      }
+
+      memberToken = await resolveUserToken(pmsUserId);
+      // Get GitHub email from PMS status
+      const ghStatus = await pmsClient.getGithubStatus(pmsUserId).catch(() => null);
+      memberAuthorEmail = ghStatus?.githubEmail ?? pmsUser?.email ?? BOT_EMAIL;
+      console.log(`[codegen-worker] using GitHub account @${ghStatus?.githubLogin ?? "?"} for member "${memberAuthorName}"`);
     } catch (tokenErr) {
       console.warn(`[codegen-worker] member GitHub token unavailable (${tokenErr.message}), falling back to bot identity`);
       memberToken = null;
-      memberAuthorName = assignee?.name ?? BOT_NAME;
-      memberAuthorEmail = BOT_EMAIL;
     }
   }
 

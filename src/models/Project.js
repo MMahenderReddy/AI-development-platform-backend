@@ -30,9 +30,9 @@ const projectSchema = new Schema(
       autoMergeMain:  { type: Boolean, default: false },
     },
 
-    teamMemberIds: [{ type: Schema.Types.ObjectId, ref: "OrchestratorUser" }],
+    teamMemberIds: [String],
     documents:     [{ type: Schema.Types.ObjectId, ref: "Document" }],
-    createdBy:     { type: Schema.Types.ObjectId, ref: "OrchestratorUser", required: true },
+    createdBy:     { type: String, default: "system" },
   },
   { timestamps: true },
 );

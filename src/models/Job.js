@@ -44,7 +44,7 @@ const jobSchema = new Schema(
     prUrl: String,
     cloneBaseSha: String,
     aiModel: String,
-    createdBy: { type: Schema.Types.ObjectId, ref: "OrchestratorUser", required: true },
+    createdBy: { type: String, default: "system" },
     assignedToPmsUserId: String,
     errorMessage: String,
     qualityGateLog: String,
