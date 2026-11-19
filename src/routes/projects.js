@@ -27,7 +27,7 @@ router.get("/", async (req, res) => {
 // Create
 router.post("/", requireRole("admin", "manager"), async (req, res) => {
   try {
-    const { name, projectId, pmsProjectId, repoConfig, deployConfig } = req.body;
+    const { name, projectId, pmsProjectId, pmsWorkspace, repoConfig, deployConfig } = req.body;
     if (!name) return res.status(400).json({ error: "name is required" });
 
     const slug = projectId ?? name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
@@ -38,6 +38,7 @@ router.post("/", requireRole("admin", "manager"), async (req, res) => {
       name,
       projectId: slug,
       pmsProjectId,
+      pmsWorkspace: pmsWorkspace === "consultants" ? "consultants" : "core",
       repoConfig,
       deployConfig,
       createdBy: req.user._id,
@@ -62,7 +63,7 @@ router.get("/:id", async (req, res) => {
 // Update
 router.patch("/:id", requireRole("admin", "manager"), async (req, res) => {
   try {
-    const allowed = ["name", "status", "repoConfig", "deployConfig", "completionPct", "teamMemberIds"];
+    const allowed = ["name", "status", "pmsProjectId", "pmsWorkspace", "repoConfig", "deployConfig", "completionPct", "teamMemberIds"];
     const update = {};
     for (const key of allowed) {
       if (req.body[key] !== undefined) update[key] = req.body[key];

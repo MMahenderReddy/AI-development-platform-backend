@@ -22,7 +22,7 @@ import { connectDb } from "../lib/db.js";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
 import OrchestratorUser from "../models/OrchestratorUser.js";
-import { pmsClient } from "../lib/pmsClient.js";
+import { pmsClientFor } from "../lib/pmsClient.js";
 import { audit } from "../lib/audit.js";
 import { getQueues } from "../lib/queues.js";
 
@@ -70,6 +70,7 @@ const processor = async (bullJob) => {
 
   if (orcJob.pmsProjectId) {
     try {
+      const pmsClient = pmsClientFor(orcJob.pmsWorkspace ?? "core");
       await pmsClient.ensureSession();
       const pmsTask = await pmsClient.createTask({
         projectId: orcJob.pmsProjectId,
@@ -91,7 +92,10 @@ const processor = async (bullJob) => {
   // Find the best assignee (same developer or fallback by capability)
   let assignedTo = originalTask.assignedTo;
   if (!assignedTo) {
-    const members = await OrchestratorUser.find({ status: "active" }).lean();
+    const members = await OrchestratorUser.find({
+      status: "active",
+      pmsWorkspace: orcJob.pmsWorkspace ?? "core",
+    }).lean();
     const area = originalTask.taskArea ?? "fullstack";
     const capMap = { frontend: ["frontend", "fullstack"], backend: ["backend", "fullstack"], fullstack: ["fullstack", "lead"] };
     const eligible = members.filter((m) => (capMap[area] ?? ["fullstack"]).includes(m.capability ?? "fullstack"));

@@ -11,7 +11,7 @@ const makeLimit = (windowMs, max, message) =>
     standardHeaders: "draft-7",
     legacyHeaders: false,
     message: { error: "RATE_LIMITED", message },
-    skip: (req) => req.ip === "::1" || req.ip === "127.0.0.1",
+    skip: (req) => ["::1", "127.0.0.1", "::ffff:127.0.0.1"].includes(req.ip),
   });
 
 /** General API: 200 req / 15 min */

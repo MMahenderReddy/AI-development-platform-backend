@@ -36,7 +36,7 @@ import Project from "../models/Project.js";
 import { getOpenAI } from "../lib/openaiClient.js";
 import { githubClient } from "../lib/githubClient.js";
 import { pushBranch, BOT_NAME, BOT_EMAIL } from "../lib/gitOps.js";
-import { pmsClient } from "../lib/pmsClient.js";
+import { pmsClientFor } from "../lib/pmsClient.js";
 import { audit } from "../lib/audit.js";
 import { getQueues } from "../lib/queues.js";
 import config from "../config/env.js";
@@ -73,7 +73,7 @@ const INTEGRATION_REVIEW_TOOL = {
   },
 };
 
-const INTEGRATION_SYSTEM = `You are a Lead Software Developer reviewing combined code changes from multiple AI developers. \
+const INTEGRATION_SYSTEM = `You are a Lead Software Developer reviewing combined code changes from multiple developers. \
 Your job is to identify integration issues — not to review code quality.
 
 Look specifically for:
@@ -194,8 +194,8 @@ const processor = async (bullJob) => {
       for (const task of repoTasks) {
         if (!task.branchName) continue;
         try {
-          // Fetch the task branch
-          await localGit.fetch("origin", task.branchName);
+          // Fetch the task branch with explicit refspec so origin/<branch> tracking ref is populated
+          await localGit.raw(["fetch", "origin", `${task.branchName}:refs/remotes/origin/${task.branchName}`]);
           const fetchRef = `origin/${task.branchName}`;
 
           // Try merge
@@ -269,8 +269,8 @@ const processor = async (bullJob) => {
           await githubClient.createPull(repoFullName, {
             branch: "integration",
             base: "main",
-            title: `[AI Integration] Job ${String(jobId).slice(-8)}`,
-            body: `Automated integration by AI Development Orchestrator.\n\nJob: \`${jobId}\`\n\nAll task branches have been merged and verified.\n\n> Review and merge to deploy.`,
+            title: `Integration: Job ${String(jobId).slice(-8)}`,
+            body: `All task branches have been merged and verified.\n\nJob: \`${jobId}\`\n\n> Review and merge to deploy.`,
           });
         } catch (prErr) {
           if (prErr.status !== 422) {

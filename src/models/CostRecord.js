@@ -6,7 +6,10 @@ const costRecordSchema = new Schema(
     taskId:  { type: Schema.Types.ObjectId, ref: "Task", index: true },
     operation: {
       type: String,
-      enum: ["extract_requirements", "generate_tasks", "generate_code"],
+      enum: [
+        "extract_requirements", "generate_tasks", "generate_code",
+        "extract_requirements_delta", "generate_tasks_delta", "requirement_diff",
+      ],
       required: true,
     },
     model:            { type: String, required: true },

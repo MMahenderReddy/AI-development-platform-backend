@@ -21,7 +21,8 @@ import tasksRouter from "./routes/tasks.js";
 import repoMappingsRouter from "./routes/repoMappings.js";
 import projectsRouter from "./routes/projects.js";
 import integrationRunsRouter from "./routes/integrationRuns.js";
-import { apiLimiter, authLimiter, uploadLimiter, jobCreateLimiter } from "./middleware/rateLimit.js";
+import githubRouter from "./routes/github.js";
+import { apiLimiter, authLimiter, uploadLimiter } from "./middleware/rateLimit.js";
 import { ApiError } from "./lib/errors.js";
 import { runStartupRecovery } from "./lib/recoveryJob.js";
 
@@ -43,13 +44,12 @@ app.get("/health", (_req, res) => {
 // ── Rate limiting ─────────────────────────────────────────────────────────────
 app.use("/api/auth", authLimiter);
 app.use("/api/documents/upload", uploadLimiter); // tighter limit for file uploads only
-app.use("/api/jobs", apiLimiter);
 app.use("/api", apiLimiter);
 
 // ── API routes ────────────────────────────────────────────────────────────────
 app.use("/api/auth", authRouter);
 app.use("/api/config", configRouter);
-app.use("/api/jobs", jobCreateLimiter, jobsRouter);
+app.use("/api/jobs", jobsRouter); // jobCreateLimiter now applied in-route on POST only
 app.use("/api/documents", documentsRouter);
 app.use("/api/approvals", approvalsRouter);
 app.use("/api/pms", pmsRouter);
@@ -58,6 +58,7 @@ app.use("/api/tasks", tasksRouter);
 app.use("/api/repo-mappings", repoMappingsRouter);
 app.use("/api/projects", projectsRouter);
 app.use("/api/integration-runs", integrationRunsRouter);
+app.use("/api/github", githubRouter);
 
 // ── Admin: Bull Board queue monitor ──────────────────────────────────────────
 app.use("/admin/queues", bullBoardRouter);

@@ -172,7 +172,12 @@ const GENERATE_TASKS_TOOL = {
               },
               estimatedHours: {
                 type: "number",
-                description: "Estimated hours to complete this task (e.g. 2, 4, 8, 16)",
+                description: "Realistic hours to complete this task (e.g. 2, 4, 8, 16, 24). Be accurate: a simple UI tweak is 2h, a full CRUD feature is 8–16h, a complex integration is 16–24h.",
+              },
+              dependsOnIndexes: {
+                type: "array",
+                items: { type: "number" },
+                description: "0-based indexes of tasks in this list that MUST be completed before this task can start. E.g. [0, 2] means this task depends on task 0 and task 2.",
               },
             },
           },
@@ -286,13 +291,15 @@ export const generateCodeForTask = async (task, codebaseContext) => {
 };
 
 const GENERATE_TASKS_SYSTEM = `You are a software project manager. Your task is to convert \
-a list of approved software requirements into actionable PMS tasks.
+a list of approved software requirements into actionable PMS tasks with realistic scheduling.
 
 Rules:
 - Each task must map to one or more requirements
 - Task titles must be under 140 characters and start with an imperative verb (Add, Fix, Build, Update, etc.)
 - Story points follow Fibonacci: 1, 2, 3, 5, 8, 13
 - Classify each task as frontend (UI components, styling, routes), backend (API, database, server logic), or fullstack (requires both)
+- estimatedHours must reflect real development effort: simple UI change = 2h, typical feature = 4–8h, complex integration = 16–24h
+- dependsOnIndexes: set this when a task CANNOT start until another task is finished (e.g. a frontend component that needs an API endpoint first). Use 0-based indexes into the tasks array you produce. Leave empty [] for independent tasks.
 - Respond exclusively by calling save_tasks — no other output`;
 
 /**
@@ -325,7 +332,12 @@ export const generateTasksFromRequirements = async (requirements) => {
 
   try {
     const parsed = JSON.parse(toolCall.function.arguments);
-    return { tasks: parsed.tasks ?? [], usage: response.usage ?? null };
+    // Normalise: ensure dependsOnIndexes is always an array
+    const tasks = (parsed.tasks ?? []).map((t) => ({
+      ...t,
+      dependsOnIndexes: Array.isArray(t.dependsOnIndexes) ? t.dependsOnIndexes : [],
+    }));
+    return { tasks, usage: response.usage ?? null };
   } catch {
     return { tasks: [], usage: response.usage ?? null };
   }

@@ -14,6 +14,7 @@ const JOB_STATUSES = [
   "integrating",
   "deploying",
   "pr_open",
+  "in_review",
   "merged",
   "deployed",
   "failed",
@@ -24,6 +25,8 @@ const JOB_STATUSES = [
   "awaiting_diff_approval",
   "awaiting_push_approval",
   "changes_requested",
+  // delta job completed with only modifications/removals — no new code to generate
+  "delta_complete",
 ];
 
 const jobSchema = new Schema(
@@ -33,6 +36,7 @@ const jobSchema = new Schema(
     projectId: { type: Schema.Types.ObjectId, ref: "Project" },
     documentId: { type: Schema.Types.ObjectId, ref: "Document" },
     pmsProjectId: String,
+    pmsWorkspace: { type: String, enum: ["core", "consultants"], default: "core" },
     pmsTaskIds: [String],
     repoFullName: String,
     branchName: String,
@@ -48,6 +52,26 @@ const jobSchema = new Schema(
     clonePath: String,                 // persistent clone dir for push step
     aiGeneratedTasks: [Schema.Types.Mixed],
     mode: { type: String, enum: ["pms", "standalone"], default: "pms" },
+    leadDevReviewStatus: { type: String, enum: ["pending", "approved", "changes_requested"], default: "pending" },
+    leadDevReviewSummary: String,
+    // delta job fields
+    jobType:    { type: String, enum: ["initial", "delta"], default: "initial" },
+    parentJobId: { type: Schema.Types.ObjectId, ref: "Job", default: undefined },
+    deltaSummary: {
+      requirementChanges: {
+        total:     Number,
+        unchanged: Number,
+        added:     Number,
+        modified:  Number,
+        removed:   Number,
+      },
+      taskActions: {
+        newTasksQueued:       Number,
+        tasksUpdated:         Number,
+        tasksCancelled:       Number,
+        tasksFlaggedForReview: Number,
+      },
+    },
     lastHeartbeatAt: Date,
     ciFailCount: { type: Number, default: 0 },  // consecutive CI failures on the integration PR
   },

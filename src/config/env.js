@@ -45,7 +45,13 @@ export default {
     appId: optional("GITHUB_APP_ID", ""),
     privateKey: githubPrivateKey,
     installationId: optional("GITHUB_APP_INSTALLATION_ID", ""),
+    prReviewer: optional("GITHUB_PR_REVIEWER", ""),
+    // OAuth: client credentials for code exchange; token storage is in PMS, not here
+    oauthClientId:     optional("GITHUB_APP_CLIENT_ID", ""),
+    oauthClientSecret: optional("GITHUB_APP_CLIENT_SECRET", ""),
+    publicUrl:         optional("ORCHESTRATOR_PUBLIC_URL", "http://localhost:4564"),
     isConfigured: () => !!(optional("GITHUB_APP_ID", "") && githubPrivateKey && optional("GITHUB_APP_INSTALLATION_ID", "")),
+    isOAuthConfigured: () => !!(optional("GITHUB_APP_CLIENT_ID", "") && optional("GITHUB_APP_CLIENT_SECRET", "")),
   },
 
   openai: {

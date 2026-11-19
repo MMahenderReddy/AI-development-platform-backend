@@ -1,7 +1,8 @@
 /**
  * Git operations for the AI code-generation pipeline.
  *
- * All commits use the bot identity — never a human user's name or email.
+ * Commits use the assigned member's identity when a userToken is provided,
+ * otherwise fall back to the bot identity.
  * Clones are stored under <workspaceDir>/clones/<jobId> for persistence across
  * the generate → push-approval → push lifecycle.
  */
@@ -11,8 +12,8 @@ import { join, resolve, sep } from "path";
 import { githubClient } from "./githubClient.js";
 import config from "../config/env.js";
 
-export const BOT_NAME = "AI Orchestrator Bot";
-export const BOT_EMAIL = "ai-orchestrator[bot]@users.noreply.github.com";
+export const BOT_NAME = process.env.BOT_NAME || "Developer";
+export const BOT_EMAIL = process.env.BOT_EMAIL || "dev@tektreeinc.com";
 
 /** Returns the persistent clone directory path for a given job ID (legacy — one dir shared by all tasks) */
 export function cloneDirForJob(jobId) {
@@ -25,17 +26,20 @@ export function cloneDirForTask(jobId, taskId) {
 }
 
 /**
- * Clone <fullName> to targetDir using a fresh GitHub App token.
- * Returns a simple-git instance pre-configured with the bot identity.
+ * Clone <fullName> to targetDir.
+ * Pass userToken to clone as the member (OAuth token); omit to use the GitHub App token.
+ * Returns a simple-git instance pre-configured with the commit identity.
  */
-export async function cloneRepo(fullName, targetDir, { depth = 100 } = {}) {
+export async function cloneRepo(fullName, targetDir, { depth = 100, userToken, authorName, authorEmail } = {}) {
   await mkdir(targetDir, { recursive: true });
-  const cloneUrl = await githubClient.cloneUrl(fullName);
+  const cloneUrl = userToken
+    ? `https://oauth:${userToken}@github.com/${fullName}.git`
+    : await githubClient.cloneUrl(fullName);
   const base = simpleGit();
   await base.clone(cloneUrl, targetDir, [`--depth=${depth}`]);
   const repo = simpleGit(targetDir);
-  await repo.addConfig("user.name", BOT_NAME);
-  await repo.addConfig("user.email", BOT_EMAIL);
+  await repo.addConfig("user.name", authorName ?? BOT_NAME);
+  await repo.addConfig("user.email", authorEmail ?? BOT_EMAIL);
   return repo;
 }
 
@@ -44,18 +48,20 @@ export async function createBranch(git, branchName, baseBranch) {
   await git.checkoutBranch(branchName, `origin/${baseBranch}`);
 }
 
-/** Stage all changes and create a commit with the bot identity already set */
+/** Stage all changes and create a commit. Identity is already set via git config from cloneRepo. */
 export async function commitChanges(git, message) {
   await git.add(".");
   return git.commit(message);
 }
 
 /**
- * Push <branchName> to origin, refreshing the GitHub App token before pushing
- * so short-lived tokens never expire between generation and push.
+ * Push <branchName> to origin.
+ * Pass userToken to push as the member (OAuth token); omit to use a fresh GitHub App token.
  */
-export async function pushBranch(git, branchName, fullName) {
-  const freshUrl = await githubClient.cloneUrl(fullName);
+export async function pushBranch(git, branchName, fullName, { userToken } = {}) {
+  const freshUrl = userToken
+    ? `https://oauth:${userToken}@github.com/${fullName}.git`
+    : await githubClient.cloneUrl(fullName);
   await git.remote(["set-url", "origin", freshUrl]);
   await git.push("origin", branchName, ["--set-upstream"]);
 }

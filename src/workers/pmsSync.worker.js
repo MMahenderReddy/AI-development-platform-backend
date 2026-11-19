@@ -19,7 +19,7 @@
 import { Worker } from "bullmq";
 import { getRedis } from "../lib/redis.js";
 import { connectDb } from "../lib/db.js";
-import { pmsClient } from "../lib/pmsClient.js";
+import { pmsClientFor } from "../lib/pmsClient.js";
 import { audit } from "../lib/audit.js";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
@@ -53,6 +53,7 @@ const processor = async (bullJob) => {
 
   const orcJob = await Job.findById(jobId);
   if (!orcJob) throw new Error(`Job ${jobId} not found`);
+  const pmsClient = pmsClientFor(orcJob.pmsWorkspace ?? "core");
 
   // Ensure PMS session is live before starting
   console.log(`\n[pms-sync-worker] Verifying PMS session...`);
@@ -121,8 +122,10 @@ const processor = async (bullJob) => {
         requirementIds: task.requirementIds ?? [],
         taskArea: task.taskArea ?? "fullstack",
         repoFullName: orcJob.repoFullName,
+        // dependsOnIndexes stored temporarily; resolved to ObjectIds after all tasks created
+        _dependsOnIndexes: task.dependsOnIndexes ?? [],
       };
-      await Task.findOneAndUpdate(
+      const created = await Task.findOneAndUpdate(
         { jobId: orcJob._id, pmsTaskId },
         { $setOnInsert: { ...taskDoc, pmsTaskId, status: "pending" } },
         { upsert: true, new: true },
@@ -137,6 +140,7 @@ const processor = async (bullJob) => {
         estimatedHours: task.estimatedHours,
         pmsTaskId,
         status: "SUCCESS",
+        _taskId: String(created._id),
       });
     } catch (err) {
       console.error(`[pms-sync-worker]   ✗ FAILED: ${err.message}`);
@@ -160,6 +164,20 @@ const processor = async (bullJob) => {
   }
 
   await bullJob.updateProgress(85);
+
+  // Resolve dependsOnIndexes → actual ObjectIds now that all tasks exist
+  // taskResults is 1-to-1 with tasks (same length, same order), so use task index directly
+  for (let i = 0; i < tasks.length; i++) {
+    const depIndexes = tasks[i].dependsOnIndexes ?? [];
+    if (depIndexes.length === 0) continue;
+    const depIds = depIndexes
+      .filter((idx) => idx !== i && taskResults[idx]?.status === "SUCCESS" && taskResults[idx]?._taskId)
+      .map((idx) => taskResults[idx]._taskId);
+    if (depIds.length > 0 && taskResults[i]?.status === "SUCCESS" && taskResults[i]?._taskId) {
+      await Task.findByIdAndUpdate(taskResults[i]._taskId, { dependsOn: depIds });
+      console.log(`[pms-sync-worker]   Dependencies set for task ${i}: depends on tasks [${depIndexes.join(", ")}]`);
+    }
+  }
 
   // Persist PMS task IDs on the job
   orcJob.pmsTaskIds = createdTaskIds;

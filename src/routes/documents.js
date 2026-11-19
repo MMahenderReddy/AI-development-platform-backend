@@ -113,6 +113,7 @@ router.post(
       const job = await Job.create({
         projectId: project._id,
         pmsProjectId: project.pmsProjectId ?? project.projectId,
+        pmsWorkspace: project.pmsWorkspace ?? "core",
         repoFullName,
         status: "analyzing",
         stage: 2,
@@ -289,5 +290,144 @@ router.post("/:id/requirements/approve", requireAuth, requireRole("admin", "mana
     next(err);
   }
 });
+
+// ── Re-analyze an updated document (delta job) ───────────────────────────────
+//
+// POST /documents/reanalyze/:projectId
+//
+// Compares a newly uploaded document against the previous job's requirements.
+// Creates a delta Job that:
+//   - cancels PMS tasks whose requirements were removed (if not yet in progress)
+//   - flags PMS tasks whose requirements changed but are already in progress
+//   - updates PMS tasks whose requirements changed and haven't started yet
+//   - creates new PMS tasks for newly added requirements
+//
+// Blocked if any job for the project is currently active.
+router.post(
+  "/reanalyze/:projectId",
+  requireAuth,
+  requireRole("admin", "manager", "lead"),
+  resolveProject,
+  upload.single("document"),
+  async (req, res, next) => {
+    try {
+      const project = req.project;
+
+      // Guard: no active jobs
+      const ACTIVE = [
+        "pending", "analyzing", "generating_tasks", "syncing_to_pms",
+        "awaiting_assignment", "auto_assigning", "generating",
+        "quality_gate", "quality_failed", "pushed", "integrating", "pr_open",
+        "changes_requested",
+      ];
+      const activeJob = await Job.findOne({ projectId: project._id, status: { $in: ACTIVE } });
+      if (activeJob) {
+        return next(
+          badRequest(
+            `An active job (${activeJob.status}) is in progress for this project. ` +
+            "Wait for it to complete before uploading a revised document.",
+          ),
+        );
+      }
+
+      // Find the latest successfully-completed job for this project.
+      // Exclude "failed" so a previous failed delta run doesn't block future uploads.
+      const TERMINAL = ["merged", "deployed", "delta_complete"];
+      const prevJob = await Job.findOne(
+        { projectId: project._id, status: { $in: TERMINAL } },
+      ).sort({ createdAt: -1 });
+
+      if (!prevJob) {
+        return next(
+          badRequest(
+            "No completed job found for this project. " +
+            "Use the initial document upload to start the first analysis.",
+          ),
+        );
+      }
+
+      // Load the previous document and validate it has approved requirements
+      const prevDoc = await Document.findOne({ jobId: prevJob._id }).sort({ createdAt: -1 }).lean();
+      if (!prevDoc) {
+        return next(badRequest("Previous job has no associated document."));
+      }
+      const prevApproved = (prevDoc.requirements ?? []).filter((r) => r.approved);
+      if (prevApproved.length === 0) {
+        return next(
+          badRequest(
+            "Previous document has no approved requirements to compare against. " +
+            "Use the initial upload instead.",
+          ),
+        );
+      }
+
+      // Determine repo from project config (fall back to parent job's repo)
+      const repoFullName =
+        project.repoConfig?.defaultRepo ||
+        project.repoConfig?.backendRepo ||
+        project.repoConfig?.frontendRepo ||
+        prevJob.repoFullName ||
+        "";
+
+      // Create the delta job
+      const deltaJob = await Job.create({
+        projectId: project._id,
+        pmsProjectId: project.pmsProjectId ?? project.projectId,
+        pmsWorkspace: project.pmsWorkspace ?? "core",
+        repoFullName,
+        jobType: "delta",
+        parentJobId: prevJob._id,
+        status: "analyzing",
+        stage: 2,
+        createdBy: req.user._id,
+      });
+
+      // Create the new document record (linked to previous document for version history)
+      const newDoc = await Document.create({
+        jobId: deltaJob._id,
+        projectId: project._id,
+        projectSlug: project.projectId,
+        originalName: req.file.originalname,
+        mimeType: req.file.mimetype,
+        sizeBytes: req.file.size,
+        storagePath: req.file.path,
+        uploadedBy: req.user._id,
+        previousDocumentId: prevDoc._id,
+        documentVersion: (prevDoc.documentVersion ?? 1) + 1,
+      });
+
+      deltaJob.documentId = newDoc._id;
+      await deltaJob.save();
+
+      // Enqueue reanalysis worker
+      const queues = getQueues();
+      await queues.reanalysis.add(
+        "reanalyze",
+        {
+          deltaJobId:  String(deltaJob._id),
+          documentId:  String(newDoc._id),
+          parentJobId: String(prevJob._id),
+        },
+        { jobId: `reanalysis-${deltaJob._id}` },
+      );
+
+      audit(req.user, "document.reanalysis_started", {
+        jobId: deltaJob._id,
+        details: {
+          projectId:          project._id,
+          fileName:           req.file.originalname,
+          sizeBytes:          req.file.size,
+          previousJobId:      prevJob._id,
+          previousDocumentId: prevDoc._id,
+          documentVersion:    newDoc.documentVersion,
+        },
+      });
+
+      res.status(201).json({ document: newDoc, job: deltaJob });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 export default router;

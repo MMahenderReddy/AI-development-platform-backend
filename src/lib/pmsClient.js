@@ -16,12 +16,12 @@ const SESSION_TTL_S = 11 * 60 * 60; // 11h — PMS JWT is 12h, re-login 1h befor
 
 const pmsUrl = (path) => `${config.pms.apiUrl}${path}`;
 
-const rawRequest = async (method, path, { body, cookie } = {}) => {
+const rawRequest = async (method, path, { body, cookie, workspace } = {}) => {
   const headers = {
     "Content-Type": "application/json",
-    "x-pms-workspace": "consultants",
   };
   if (cookie) headers["Cookie"] = `pms_token=${cookie}`;
+  if (workspace === "consultants") headers["x-pms-workspace"] = "consultants";
 
   const res = await fetch(pmsUrl(path), {
     method,
@@ -81,7 +81,6 @@ const request = async (method, path, options = {}, retried = false) => {
     return await rawRequest(method, path, { ...options, cookie: token });
   } catch (err) {
     if (err.code === "PMS_UNAUTHORIZED" && !retried) {
-      // Token may have expired early — force re-login once
       await getRedis().del(SESSION_KEY);
       const fresh = await login();
       return rawRequest(method, path, { ...options, cookie: fresh });
@@ -90,110 +89,70 @@ const request = async (method, path, options = {}, retried = false) => {
   }
 };
 
-// ── Public API ───────────────────────────────────────────────────────────────
-
-export const pmsClient = {
-  /** Verify the session is working and return the current service account user. */
-  me: () => request("GET", "/api/auth/me"),
-
-  /** Force a fresh login (useful on startup). */
+// ── Workspace-scoped client factory ──────────────────────────────────────────
+// Workers use pmsClientFor(orcJob.pmsWorkspace ?? "core") to scope all API
+// calls to the correct workspace (core = Tek Tree, consultants = Consultants).
+const clientFor = (workspace) => ({
+  me: () => request("GET", "/api/auth/me", { workspace }),
   ensureSession: async () => {
-    try {
-      await pmsClient.me();
-    } catch {
-      await getRedis().del(SESSION_KEY);
-      await login();
-    }
+    try { await request("GET", "/api/auth/me", { workspace }); }
+    catch { await getRedis().del(SESSION_KEY); await login(); }
   },
-
-  // ── Projects ──────────────────────────────────────────────────────────────
-
-  /** List all projects the service account can see. Returns projects that have a repo set. */
-  listProjects: () => request("GET", "/api/projects"),
-
-  getProject: (projectId) => request("GET", `/api/projects/${encodeURIComponent(projectId)}`),
-
-  // ── Tasks ─────────────────────────────────────────────────────────────────
-
-  /**
-   * Create a PMS task as the orchestrator service account.
-   * Uses /api/tasks/ai-create which: requires no assignee, sets reporter="system",
-   * and handles idempotency by source key to prevent duplicates on retry.
-   */
+  listProjects: () => request("GET", "/api/projects", { workspace }),
+  getProject: (projectId) => request("GET", `/api/projects/${encodeURIComponent(projectId)}`, { workspace }),
   createTask: (input) =>
     request("POST", "/api/tasks/ai-create", {
-      body: {
-        ...input,
-        source: input.source ?? undefined,
-      },
+      body: { ...input, source: input.source ?? undefined },
+      workspace,
     }),
-
   moveTask: (taskId, to, reason) =>
-    request("POST", `/api/tasks/${encodeURIComponent(taskId)}/move`, { body: { to, reason } }),
-
-  getTask: (taskId) => request("GET", `/api/tasks/${encodeURIComponent(taskId)}`),
-
-  /**
-   * Look up a task by its `source` string — the idempotency key the orchestrator stamps
-   * on every task it creates. Returns the task object if found, null if not.
-   * Uses the PMS task list endpoint filtered by source (best-effort — returns null on
-   * any error so callers fall through to creating the task instead).
-   */
+    request("POST", `/api/tasks/${encodeURIComponent(taskId)}/move`, { body: { to, reason }, workspace }),
+  getTask: (taskId) => request("GET", `/api/tasks/${encodeURIComponent(taskId)}`, { workspace }),
   getTaskBySource: async (sourceKey) => {
     try {
-      const res = await request("GET", `/api/tasks?source=${encodeURIComponent(sourceKey)}&limit=1`);
+      const res = await request("GET", `/api/tasks?source=${encodeURIComponent(sourceKey)}&limit=1`, { workspace });
       const tasks = Array.isArray(res) ? res : (res?.tasks ?? res?.data ?? []);
       return tasks.length > 0 ? tasks[0] : null;
-    } catch {
-      return null;
-    }
+    } catch { return null; }
   },
-
-  /**
-   * List all users visible to the service account in the current workspace.
-   * Returns an array of PMS user objects (with _id, name, email, role, title fields).
-   */
-  listUsers: () => request("GET", "/api/users"),
-
-  /**
-   * Fetch the members of a specific PMS project.
-   * Returns the project object (which has a `members` array of user IDs).
-   */
+  listUsers: () => request("GET", "/api/users", { workspace }),
   getProjectMembers: async (projectId) => {
-    const proj = await request("GET", `/api/projects/${encodeURIComponent(projectId)}`);
+    const proj = await request("GET", `/api/projects/${encodeURIComponent(projectId)}`, { workspace });
     if (!proj?.members?.length) return [];
-    // Fetch all workspace users, then filter to project members.
-    // PMS REST API serialises the user id as `id` (not `_id`), so check both.
-    const allUsers = await request("GET", "/api/users");
+    const allUsers = await request("GET", "/api/users", { workspace });
     const memberSet = new Set(proj.members.map(String));
     return (Array.isArray(allUsers) ? allUsers : []).filter((u) =>
       memberSet.has(String(u.id ?? u._id)),
     );
   },
-
-  /**
-   * Partial-update a PMS task (assignee, title, description, priority, due, points).
-   * taskId is the PMS task _id string (e.g. "TEST-12").
-   * patch is a plain object with the fields to change.
-   */
   updateTask: (taskId, patch) =>
-    request("PATCH", `/api/tasks/${encodeURIComponent(taskId)}`, { body: patch }),
-
-  // ── Pull Requests ─────────────────────────────────────────────────────────
-
-  /**
-   * Create a PR via PMS. The branch must already exist on GitHub.
-   * PMS will auto-move the linked task from todo/in_progress → in_review.
-   * title: 5–120 chars; description: max 10,000 chars.
-   */
+    request("PATCH", `/api/tasks/${encodeURIComponent(taskId)}`, { body: patch, workspace }),
+  storeGithubCredentials: (pmsUserId, data) =>
+    request("POST", `/api/github/oauth/credentials/${encodeURIComponent(pmsUserId)}`, { body: data, workspace }),
+  getGithubToken: (pmsUserId) =>
+    request("GET", `/api/github/oauth/credentials/${encodeURIComponent(pmsUserId)}/token`, { workspace }),
+  getGithubStatus: (pmsUserId) =>
+    request("GET", `/api/github/oauth/credentials/${encodeURIComponent(pmsUserId)}/status`, { workspace }),
+  disconnectGithub: (pmsUserId) =>
+    request("DELETE", `/api/github/oauth/credentials/${encodeURIComponent(pmsUserId)}`, { workspace }),
   createPull: (projectId, { branch, title, description }) =>
     request("POST", `/api/pulls/${encodeURIComponent(projectId)}`, {
-      body: { branch, title, description },
+      body: { branch, title, description }, workspace,
     }),
-
   getPull: (projectId, number) =>
-    request("GET", `/api/pulls/${encodeURIComponent(projectId)}/${number}`),
-
+    request("GET", `/api/pulls/${encodeURIComponent(projectId)}/${number}`, { workspace }),
   listPullsForProject: (projectId) =>
-    request("GET", `/api/pulls/${encodeURIComponent(projectId)}`),
-};
+    request("GET", `/api/pulls/${encodeURIComponent(projectId)}`, { workspace }),
+});
+
+// ── Public API ───────────────────────────────────────────────────────────────
+
+/** Default client scoped to the core (Tek Tree) workspace. */
+export const pmsClient = clientFor("core");
+
+/**
+ * Return a workspace-scoped PMS client.
+ * Workers should call: const client = pmsClientFor(orcJob.pmsWorkspace ?? "core")
+ * @param {string} workspace  "core" | "consultants"
+ */
+export const pmsClientFor = (workspace) => clientFor(workspace ?? "core");

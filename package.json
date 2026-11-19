@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "node --watch src/server.js",
     "start": "node src/server.js",
-    "dev:all": "concurrently -n api,analysis,codegen,qgate,push,rework,integration,pms,assign,prpoll,deploy -c blue,green,cyan,yellow,magenta,red,white,gray,greenBright,cyanBright,yellowBright \"npm run dev\" \"npm run worker:analysis\" \"npm run worker:codegen\" \"npm run worker:quality-gate\" \"npm run worker:push\" \"npm run worker:rework\" \"npm run worker:integration\" \"npm run worker:pms-sync\" \"npm run worker:task-assignment\" \"npm run worker:pr-poll\" \"npm run worker:deploy\"",
+    "dev:all": "concurrently -n api,analysis,codegen,qgate,push,rework,integration,pms,assign,prpoll,deploy,daily,reanalysis,review -c blue,green,cyan,yellow,magenta,red,white,gray,greenBright,cyanBright,yellowBright,blueBright,redBright,magentaBright \"npm run dev\" \"npm run worker:analysis\" \"npm run worker:codegen\" \"npm run worker:quality-gate\" \"npm run worker:push\" \"npm run worker:rework\" \"npm run worker:integration\" \"npm run worker:pms-sync\" \"npm run worker:task-assignment\" \"npm run worker:pr-poll\" \"npm run worker:deploy\" \"npm run worker:daily-scheduler\" \"npm run worker:reanalysis\" \"npm run worker:code-review\"",
     "worker:analysis": "node --watch src/workers/analysis.worker.js",
     "worker:codegen": "node --watch src/workers/codegen.worker.js",
     "worker:quality-gate": "node --watch src/workers/qualityGate.worker.js",
@@ -16,7 +16,10 @@
     "worker:pms-sync": "node --watch src/workers/pmsSync.worker.js",
     "worker:task-assignment": "node --watch src/workers/taskAssignment.worker.js",
     "worker:pr-poll": "node --watch src/workers/prPoll.worker.js",
-    "worker:deploy": "node --watch src/workers/deploy.worker.js"
+    "worker:deploy": "node --watch src/workers/deploy.worker.js",
+    "worker:daily-scheduler": "node --watch src/workers/dailyScheduler.worker.js",
+    "worker:reanalysis": "node --watch src/workers/reanalysis.worker.js",
+    "worker:code-review": "node --watch src/workers/codeReview.worker.js"
   },
   "dependencies": {
     "@bull-board/api": "^9.13.1",

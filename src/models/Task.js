@@ -25,7 +25,10 @@ const taskSchema = new Schema(
     description:   String,
     type:          { type: String, enum: ["task", "bug", "feature", "improvement"], default: "task" },
     priority:      { type: String, enum: ["urgent", "high", "medium", "low"], default: "medium" },
-    points:        Number,
+    points:         Number,
+    estimatedHours: Number,
+    scheduledDate:  { type: Date, index: true },   // date this task is dispatched to codegen
+    dueDate:        { type: Date },                 // expected completion date
     requirementIds: [String],
     taskArea: { type: String, enum: ["frontend", "backend", "fullstack"], default: "fullstack" },
 
@@ -68,6 +71,11 @@ const taskSchema = new Schema(
 
     errorMessage:    String,
     lastHeartbeatAt: Date,
+
+    // document-update tracking
+    obsolete:         { type: Boolean, default: false },      // requirement removed in a doc update
+    flaggedForReview: { type: Boolean, default: false },      // req changed but task already in-progress
+    flagNote:         String,                                  // reason for the flag
   },
   { timestamps: true },
 );

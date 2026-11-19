@@ -22,16 +22,19 @@ import { connectDb } from "../lib/db.js";
 import { simpleGit } from "simple-git";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
-import { githubClient } from "../lib/githubClient.js";
+import OrchestratorUser from "../models/OrchestratorUser.js";
+import { githubClient, githubUserClient } from "../lib/githubClient.js";
+import { resolveUserToken } from "../lib/githubOAuth.js";
+import config from "../config/env.js";
 import { pushBranch, BOT_NAME, BOT_EMAIL } from "../lib/gitOps.js";
-import { pmsClient } from "../lib/pmsClient.js";
+import { pmsClientFor } from "../lib/pmsClient.js";
 import { audit } from "../lib/audit.js";
 import { getQueues } from "../lib/queues.js";
 import { existsSync } from "fs";
 
 await connectDb();
 
-const PUSHED_TERMINAL = new Set(["pushed", "pr_open", "merged", "failed", "cancelled"]);
+const PUSHED_TERMINAL = new Set(["pushed", "pr_open", "merged", "failed", "cancelled", "quality_failed"]);
 
 /** Check if all tasks for a job have reached a terminal state and at least one is pushed. */
 async function checkIntegrationReady(jobId) {
@@ -73,13 +76,28 @@ const processor = async (bullJob) => {
 
   await bullJob.updateProgress(10);
 
-  // Push branch to GitHub
+  // Resolve member's GitHub OAuth token for push authentication
+  let memberToken = null;
+  let memberGitHubLogin = null;
+  if (task?.assignedTo) {
+    try {
+      memberToken = await resolveUserToken(String(task.assignedTo));
+      const assignee = await OrchestratorUser.findById(task.assignedTo)
+        .select("githubAuth.githubLogin githubAuth.githubEmail name")
+        .lean();
+      memberGitHubLogin = assignee?.githubAuth?.githubLogin ?? null;
+      console.log(`[push-worker] using GitHub account @${memberGitHubLogin ?? "?"} for push`);
+    } catch (err) {
+      console.warn(`[push-worker] member GitHub token unavailable (${err.message}), falling back to GitHub App token`);
+      memberToken = null;
+    }
+  }
+
+  // Push branch to GitHub using member's token
   const git = simpleGit(clonePath);
-  await git.addConfig("user.name", BOT_NAME, false, "local");
-  await git.addConfig("user.email", BOT_EMAIL, false, "local");
 
   try {
-    await pushBranch(git, branchName, repoFullName);
+    await pushBranch(git, branchName, repoFullName, { userToken: memberToken });
   } catch (err) {
     throw new Error(`Push failed for branch ${branchName}: ${err.message}`);
   }
@@ -96,25 +114,24 @@ const processor = async (bullJob) => {
   let prUrl = null;
 
   const prTitle = task
-    ? `[AI] ${task.title.slice(0, 100)}`
-    : `[AI] Orchestrator job ${String(jobId).slice(-8)}`;
+    ? task.title.slice(0, 100)
+    : `Job ${String(jobId).slice(-8)}`;
 
   const prBody = [
-    `AI-generated code from the AI Development Orchestrator.`,
-    ``,
-    `**Job:** \`${jobId}\``,
     task ? `**Task:** ${task.title}` : "",
     task?.taskArea ? `**Area:** ${task.taskArea}` : "",
     ``,
-    `> This PR was opened automatically. The integration agent will review and merge.`,
+    `**Job:** \`${jobId}\``,
   ].filter(Boolean).join("\n");
 
-  // Try preferred base (integration), fall back to main if it doesn't exist
+  // Try preferred base (integration), fall back to main if it doesn't exist.
+  // Use the member's GitHub client so the PR appears under their identity.
   const baseCandidates = prBase !== baseBranch ? [prBase, baseBranch] : [baseBranch];
+  const ghClient = memberToken ? githubUserClient(memberToken) : githubClient;
 
   for (const candidate of baseCandidates) {
     try {
-      const pr = await githubClient.createPull(repoFullName, {
+      const pr = await ghClient.createPull(repoFullName, {
         branch: branchName,
         base: candidate,
         title: prTitle,
@@ -122,20 +139,26 @@ const processor = async (bullJob) => {
       });
       prNumber = pr.number;
       prUrl = pr.htmlUrl;
-      console.log(`[push-worker] created PR #${prNumber} → ${candidate}: ${prUrl}`);
+      console.log(`[push-worker] created PR #${prNumber} → ${candidate} as @${memberGitHubLogin ?? "app"}: ${prUrl}`);
+
+      // Request review from the configured lead reviewer
+      const reviewer = config.github.prReviewer;
+      if (reviewer) {
+        await ghClient.requestReviewers(repoFullName, prNumber, [reviewer]);
+        console.log(`[push-worker] requested review from @${reviewer} on PR #${prNumber}`);
+      }
       break;
     } catch (err) {
       if (err.status === 422) {
         // Could be: (a) base branch doesn't exist → try next candidate
         //           (b) PR already open for this branch → look it up
-        const existing = await githubClient.findPullByBranch(repoFullName, branchName).catch(() => null);
+        const existing = await ghClient.findPullByBranch(repoFullName, branchName).catch(() => null);
         if (existing) {
           prNumber = existing.number;
           prUrl = existing.htmlUrl;
           console.log(`[push-worker] PR already open for branch ${branchName} — reused #${prNumber}: ${prUrl}`);
           break;
         }
-        // base branch probably doesn't exist — try next candidate
         console.warn(`[push-worker] PR base "${candidate}" rejected (422) — trying next candidate`);
       } else {
         console.warn(`[push-worker] PR creation failed: ${err.message} — branch was pushed`);
@@ -160,11 +183,22 @@ const processor = async (bullJob) => {
     });
   }
 
-  // Update PMS task status to in_review
+  // Update PMS task status to in_review (two-step if currently todo)
   if (task?.pmsTaskId) {
     try {
+      const pmsClient = pmsClientFor(orcJob.pmsWorkspace ?? "core");
       await pmsClient.ensureSession();
-      await pmsClient.moveTask(task.pmsTaskId, "in_review").catch(() => {});
+      try {
+        await pmsClient.moveTask(task.pmsTaskId, "in_review");
+      } catch (directErr) {
+        if (directErr.message?.includes("can only move to")) {
+          await pmsClient.moveTask(task.pmsTaskId, "in_progress");
+          await pmsClient.moveTask(task.pmsTaskId, "in_review");
+        } else {
+          throw directErr;
+        }
+      }
+      console.log(`[push-worker] PMS task ${task.pmsTaskId} → in_review`);
     } catch (err) {
       console.warn(`[push-worker] could not update PMS task ${task.pmsTaskId}: ${err.message}`);
     }
@@ -172,19 +206,20 @@ const processor = async (bullJob) => {
 
   await bullJob.updateProgress(85);
 
-  // Update job-level pushed info
+  // Update job-level pushed info; reset Lead Dev review so new diff gets reviewed
   await Job.findByIdAndUpdate(jobId, {
     status: "pushed",
     stage: 8,
     branchName: orcJob.branchName ?? branchName,
     prNumber: orcJob.prNumber ?? prNumber ?? undefined,
     prUrl: orcJob.prUrl ?? prUrl ?? undefined,
+    leadDevReviewStatus: "pending",
     $unset: { errorMessage: 1 },
   });
 
   audit("system", "push.completed", {
     jobId: orcJob._id,
-    details: { branchName, repoFullName, prNumber },
+    details: { branchName, repoFullName, prNumber, githubLogin: memberGitHubLogin },
   });
 
   // Check if all tasks are pushed → fire integration worker

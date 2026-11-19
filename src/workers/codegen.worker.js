@@ -38,7 +38,7 @@ import { Worker } from "bullmq";
 import { existsSync } from "fs";
 import { getRedis } from "../lib/redis.js";
 import { connectDb } from "../lib/db.js";
-import { pmsClient } from "../lib/pmsClient.js";
+import { pmsClientFor } from "../lib/pmsClient.js";
 import { generateCodeForTask } from "../lib/openaiClient.js";
 import { writeFileSafe } from "../lib/fileSandbox.js";
 import {
@@ -58,9 +58,11 @@ import { detectConflicts } from "../lib/conflictDetect.js";
 import { audit } from "../lib/audit.js";
 import { getQueues } from "../lib/queues.js";
 import { recordCost } from "../lib/costTracker.js";
+import { resolveUserToken } from "../lib/githubOAuth.js";
 import config from "../config/env.js";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
+import OrchestratorUser from "../models/OrchestratorUser.js";
 
 await connectDb();
 
@@ -122,6 +124,7 @@ const processor = async (bullJob) => {
   // ── Step 1: Load orchestrator job + Task document ────────────────────────
   const orcJob = await Job.findById(jobId);
   if (!orcJob) throw new Error(`Job ${jobId} not found`);
+  const pmsClient = pmsClientFor(orcJob.pmsWorkspace ?? "core");
 
   // Find the Task document (best-effort — may not exist on legacy jobs)
   const taskDoc = pmsTaskId
@@ -165,6 +168,37 @@ const processor = async (bullJob) => {
   await bullJob.updateProgress(5);
   console.log(`[codegen-worker] implementing: "${task.title}"`);
 
+  // ── Step 3b: Resolve member GitHub credentials ────────────────────────────
+  // Must happen before clone so we know which token to use.
+  // Hard-fails if member has not connected their GitHub account.
+  let memberSlug = "dev";
+  let memberToken = null;
+  let memberAuthorName = "Developer";
+  let memberAuthorEmail = BOT_EMAIL;
+
+  if (taskDoc?.assignedTo) {
+    const assignee = await OrchestratorUser.findById(taskDoc.assignedTo)
+      .select("name githubAuth.githubLogin githubAuth.githubEmail githubAuth.connectedAt")
+      .lean();
+
+    if (assignee?.name) {
+      memberSlug = toBranchSlug(assignee.name.split(" ")[0]);
+    }
+
+    // resolveUserToken throws if not connected or pmsUserId not set — fall back to bot identity
+    try {
+      memberToken = await resolveUserToken(String(taskDoc.assignedTo));
+      memberAuthorName = assignee?.name ?? BOT_NAME;
+      memberAuthorEmail = assignee?.githubAuth?.githubEmail ?? BOT_EMAIL;
+      console.log(`[codegen-worker] using GitHub account @${assignee?.githubAuth?.githubLogin ?? "?"} for member "${assignee?.name}"`);
+    } catch (tokenErr) {
+      console.warn(`[codegen-worker] member GitHub token unavailable (${tokenErr.message}), falling back to bot identity`);
+      memberToken = null;
+      memberAuthorName = assignee?.name ?? BOT_NAME;
+      memberAuthorEmail = BOT_EMAIL;
+    }
+  }
+
   // ── Step 4: Set up per-task isolated clone directory ─────────────────────
   // Each task gets its own dir (clones/<jobId>/<taskId>) so tasks of the same
   // job never wipe each other's working tree.
@@ -180,7 +214,11 @@ const processor = async (bullJob) => {
   console.log(`[codegen-worker] cloning ${repoFullName} → ${cloneDir}`);
   let git;
   try {
-    git = await cloneRepo(repoFullName, cloneDir);
+    git = await cloneRepo(repoFullName, cloneDir, {
+      userToken: memberToken,
+      authorName: memberAuthorName,
+      authorEmail: memberAuthorEmail,
+    });
   } catch (err) {
     throw new Error(`Clone failed for ${repoFullName}: ${err.message}`);
   }
@@ -200,8 +238,7 @@ const processor = async (bullJob) => {
   orcJob.cloneBaseSha = cloneBaseSha;
 
   // ── Step 7: Create feature branch ────────────────────────────────────────
-  const shortJobId = String(jobId).slice(-8);
-  const branchName = `orch/${shortJobId}/${toBranchSlug(task.title)}`;
+  const branchName = `orch/${memberSlug}/${toBranchSlug(task.title)}`;
   try {
     await createBranch(git, branchName, baseBranch);
   } catch (err) {
@@ -285,17 +322,12 @@ const processor = async (bullJob) => {
 
   await bullJob.updateProgress(70);
 
-  // ── Step 11: Commit with bot identity ────────────────────────────────────
+  // ── Step 11: Commit with member identity ─────────────────────────────────
   const commitMsg = [
     generated.commitMessage || `feat: ${task.title.slice(0, 72)}`,
     "",
-    `AI-generated code for PMS task: ${task.title}`,
-    `Job ID: ${jobId}`,
-    `PMS Task ID: ${pmsTaskId}`,
-    "",
-    // Explicit bot attribution — never impersonates a human
-    `AI Developer: ${BOT_NAME} <${BOT_EMAIL}>`,
-    `Generated-by: AI Orchestrator`,
+    `Implements: ${task.title}`,
+    `Task: ${pmsTaskId}`,
   ].join("\n");
 
   await commitChanges(git, commitMsg);

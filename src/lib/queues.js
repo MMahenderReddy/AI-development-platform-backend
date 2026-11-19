@@ -57,6 +57,18 @@ export const getQueues = () => {
       connection,
       defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 3, backoff: { type: "exponential", delay: 60_000 } },
     }),
+    dailyScheduler: new Queue("daily-scheduler", {
+      connection,
+      defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 1 },
+    }),
+    reanalysis: new Queue("reanalysis", {
+      connection,
+      defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 2, backoff: { type: "exponential", delay: 30_000 } },
+    }),
+    codeReview: new Queue("code-review", {
+      connection,
+      defaultJobOptions: { ...DEFAULT_JOB_OPTIONS, attempts: 3, backoff: { type: "exponential", delay: 15_000 } },
+    }),
   };
   return _queues;
 };

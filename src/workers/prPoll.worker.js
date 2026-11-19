@@ -1,3 +1,4 @@
+import "dotenv/config";
 /**
  * PR Poll Worker — Lead Developer AI: auto-merge gate
  *
@@ -29,7 +30,7 @@ import { Worker } from "bullmq";
 import { getRedis } from "../lib/redis.js";
 import { connectDb } from "../lib/db.js";
 import { githubClient } from "../lib/githubClient.js";
-import { pmsClient } from "../lib/pmsClient.js";
+import { pmsClientFor } from "../lib/pmsClient.js";
 import { cleanupClone } from "../lib/gitOps.js";
 import { audit } from "../lib/audit.js";
 import { getQueues } from "../lib/queues.js";
@@ -40,17 +41,58 @@ await connectDb();
 
 const MAX_CI_FAIL_RETRIES = Number(process.env.CI_FAIL_MAX_RETRIES ?? 3);
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/**
+ * PMS state machine: todo → in_progress → in_review → done
+ * Attempts a direct move to "done"; if the transition rule blocks it,
+ * steps through each intermediate in order and retries "done" after each.
+ */
+async function advanceTosDone(pmsClient, taskId, note) {
+  const intermediates = ["in_progress", "in_review"];
+  const isRuleError = (e) => e.message?.includes("can only move to") || e.status === 422;
+
+  try {
+    await pmsClient.moveTask(taskId, "done", note);
+    return;
+  } catch (e) {
+    if (!isRuleError(e)) throw e;
+  }
+
+  for (const step of intermediates) {
+    try {
+      await pmsClient.moveTask(taskId, step, note);
+    } catch (e) {
+      if (!isRuleError(e)) throw e;
+      // already past this step — continue
+    }
+    try {
+      await pmsClient.moveTask(taskId, "done", note);
+      return;
+    } catch (e) {
+      if (!isRuleError(e)) throw e;
+      // need more steps
+    }
+  }
+
+  throw new Error(`PMS task ${taskId}: unable to reach "done" via any transition path`);
+}
+
 // ── Shared: handle a successfully merged PR ───────────────────────────────────
 
 async function onMerged(orcJob, prNumber, repoFullName) {
   console.log(`[pr-poll-worker] PR #${prNumber} merged — completing job ${orcJob._id}`);
 
   // Move PMS tasks to done (best-effort)
+  const pmsClient = pmsClientFor(orcJob.pmsWorkspace ?? "core");
   try {
     await pmsClient.ensureSession();
+    const mergedNote = `PR #${prNumber} merged on ${new Date().toISOString()}`;
     for (const taskId of orcJob.pmsTaskIds ?? []) {
       try {
-        await pmsClient.moveTask(taskId, "done", `PR #${prNumber} merged on ${new Date().toISOString()}`);
+        // PMS state machine: todo → in_progress → in_review → done (3 hops)
+        // Try direct move first; if blocked by a rule error, step through intermediates
+        await advanceTosDone(pmsClient, taskId, mergedNote);
         console.log(`[pr-poll-worker] PMS task ${taskId} → done`);
       } catch (e) {
         console.warn(`[pr-poll-worker] could not move task ${taskId} to done:`, e.message);
@@ -250,25 +292,46 @@ const processor = async (bullJob) => {
     throw new Error(`PR #${prNumber} CI checks still running — will check again in 5 minutes`);
   }
 
-  // No checks registered yet — give CI time to start (treat as pending)
+  // No checks registered yet — if GITHUB_AUTO_MERGE_NO_CI is set, merge anyway
   if (checks.runs.length === 0) {
-    throw new Error(`PR #${prNumber} has no CI checks yet — will check again in 5 minutes`);
+    if (process.env.GITHUB_AUTO_MERGE_NO_CI === "true") {
+      console.log(`[pr-poll-worker] PR #${prNumber} has no CI checks — GITHUB_AUTO_MERGE_NO_CI=true, proceeding to merge`);
+    } else {
+      throw new Error(`PR #${prNumber} has no CI checks yet — will check again in 5 minutes`);
+    }
   }
 
-  // ── All CI checks passed → auto-merge ────────────────────────────────────
-  console.log(`[pr-poll-worker] PR #${prNumber} all checks passed — auto-merging`);
+  // ── CI passed → mandatory Lead Developer review gate ─────────────────────
+  // Re-load job to get current leadDevReviewStatus (may have been updated by codeReview worker)
+  const freshJob = await Job.findById(jobId).select("leadDevReviewStatus").lean();
+  const reviewStatus = freshJob?.leadDevReviewStatus ?? "pending";
+
+  if (reviewStatus !== "approved") {
+    // Enqueue code review (idempotent — fixed jobId prevents duplicates)
+    const queues = getQueues();
+    await queues.codeReview.add(
+      "review-pr",
+      { jobId: String(orcJob._id), prNumber, repoFullName },
+      { jobId: `code-review-${orcJob._id}` },
+    );
+
+    if (orcJob.status !== "in_review") {
+      await Job.findByIdAndUpdate(jobId, { status: "in_review" });
+    }
+
+    console.log(`[pr-poll-worker] PR #${prNumber} CI passed — awaiting Lead Developer review (status: ${reviewStatus})`);
+    throw new Error(`PR #${prNumber} awaiting Lead Developer review — will re-check in 5 minutes`);
+  }
+
+  // ── Lead Developer approved → merge ──────────────────────────────────────
+  console.log(`[pr-poll-worker] PR #${prNumber} Lead Developer approved — merging`);
 
   const shortJobId = String(jobId).slice(-8);
   try {
     await githubClient.mergePull(repoFullName, prNumber, {
       mergeMethod: "squash",
-      commitTitle: `[AI Orchestrator] Job ${shortJobId} — autonomous integration`,
-      commitMessage: [
-        `Squash-merged by AI Development Orchestrator.`,
-        ``,
-        `Job: ${jobId}`,
-        `All CI checks passed. Merged autonomously — no human review required.`,
-      ].join("\n"),
+      commitTitle: `Merge changes for job ${shortJobId}`,
+      commitMessage: `Job: ${jobId}`,
     });
   } catch (mergeErr) {
     // 405 = not mergeable yet (GitHub says wait), 409 = conflicting
@@ -276,16 +339,16 @@ const processor = async (bullJob) => {
       console.warn(`[pr-poll-worker] merge not ready (${mergeErr.status}) — will retry: ${mergeErr.message}`);
       throw new Error(`PR #${prNumber} not yet mergeable (${mergeErr.status}) — will retry`);
     }
-    throw new Error(`Auto-merge failed for PR #${prNumber}: ${mergeErr.message}`);
+    throw new Error(`Merge failed for PR #${prNumber}: ${mergeErr.message}`);
   }
 
-  audit("system", "pr.auto_merged", {
+  audit("system", "pr.merged_after_review", {
     jobId: orcJob._id,
     details: { prNumber, repoFullName, headSha: pr.headSha },
   });
 
   await onMerged(orcJob, prNumber, repoFullName);
-  return { merged: true, prNumber, autoMerged: true };
+  return { merged: true, prNumber, reviewApproved: true };
 };
 
 // ── Worker setup ──────────────────────────────────────────────────────────────

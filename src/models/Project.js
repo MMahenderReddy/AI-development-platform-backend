@@ -5,6 +5,7 @@ const projectSchema = new Schema(
     name:         { type: String, required: true, trim: true },
     projectId:    { type: String, required: true, unique: true, lowercase: true, trim: true },
     pmsProjectId: { type: String, required: true },
+    pmsWorkspace: { type: String, enum: ["core", "consultants"], default: "core" },
     status: {
       type: String,
       enum: ["setup", "analyzing", "developing", "integrating", "deploying", "done", "failed", "paused"],

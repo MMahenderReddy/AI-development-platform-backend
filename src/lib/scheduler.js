@@ -26,11 +26,34 @@ import OrchestratorUser from "../models/OrchestratorUser.js";
 import Task from "../models/Task.js";
 import Job from "../models/Job.js";
 import { getQueues } from "./queues.js";
-import { pmsClient } from "./pmsClient.js";
+import { pmsClientFor } from "./pmsClient.js";
 import config from "../config/env.js";
 import { audit } from "./audit.js";
 
 const PRIORITY_ORDER = { urgent: 0, high: 1, medium: 2, low: 3 };
+
+// Max tasks dispatched to codegen per member per day
+const MAX_TASKS_PER_MEMBER_PER_DAY = Number(process.env.MAX_TASKS_PER_MEMBER_PER_DAY ?? 2);
+
+/** Return midnight (00:00:00) of a date offset by `daysAhead` working days from today. */
+function workingDayOffset(daysAhead) {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  let added = 0;
+  while (added < daysAhead) {
+    d.setDate(d.getDate() + 1);
+    const dow = d.getDay();
+    if (dow !== 0 && dow !== 6) added++; // skip Sat/Sun
+  }
+  return d;
+}
+
+/** True if two Date values fall on the same calendar day. */
+function isSameDay(a, b) {
+  return a.getFullYear() === b.getFullYear() &&
+    a.getMonth() === b.getMonth() &&
+    a.getDate() === b.getDate();
+}
 
 const sep = "=".repeat(50);
 
@@ -116,10 +139,10 @@ function guessPmsCapability(user) {
  * Returns an array of PMS user objects enriched with a guessed capability field.
  * Returns empty array on error so callers fall back gracefully.
  */
-async function fetchPmsProjectMembers(pmsProjectId) {
+async function fetchPmsProjectMembers(pmsProjectId, workspace = "core") {
   if (!pmsProjectId) return [];
   try {
-    const members = await pmsClient.getProjectMembers(pmsProjectId);
+    const members = await pmsClientFor(workspace).getProjectMembers(pmsProjectId);
     const enriched = (Array.isArray(members) ? members : []).map((u) => ({
       ...u,
       // PMS REST API uses `id`, not `_id` — normalise so downstream code works
@@ -167,6 +190,7 @@ export async function scheduleTasks(jobId) {
 
   const orcJob = await Job.findById(jobId);
   if (!orcJob) throw new Error(`Job ${jobId} not found`);
+  const pmsClient = pmsClientFor(orcJob.pmsWorkspace ?? "core");
 
   // ── Step 1: Load pending tasks ──────────────────────────────────────────
   const tasks = await Task.find({ jobId: orcJob._id, status: "pending" });
@@ -180,8 +204,11 @@ export async function scheduleTasks(jobId) {
     console.log(`[scheduler]   • [${t.pmsTaskId}] "${t.title}" | priority=${t.priority} area=${t.taskArea} type=${t.type}`);
   }
 
-  // ── Step 2: Load active orchestrator team members ───────────────────────
-  const members = await OrchestratorUser.find({ status: "active" }).lean();
+  // ── Step 2: Load active orchestrator team members for this workspace ────
+  const members = await OrchestratorUser.find({
+    status: "active",
+    pmsWorkspace: orcJob.pmsWorkspace ?? "core",
+  }).lean();
   console.log(`\n[scheduler] STEP 2 — Active orchestrator team members: ${members.length}`);
   if (members.length === 0) {
     console.warn(`[scheduler] ⚠ No active members — cannot auto-assign. Falling back to awaiting_assignment.`);
@@ -237,7 +264,7 @@ export async function scheduleTasks(jobId) {
 
   // ── Step 4: Fetch PMS project members for PMS assignee sync ─────────────
   console.log(`\n[scheduler] STEP 4 — Fetching PMS project members for assignee sync`);
-  const pmsMembers = await fetchPmsProjectMembers(orcJob.pmsProjectId);
+  const pmsMembers = await fetchPmsProjectMembers(orcJob.pmsProjectId, orcJob.pmsWorkspace ?? "core");
   const pmsCounts = Object.fromEntries(pmsMembers.map((m) => [String(m._id), 0]));
 
   if (pmsMembers.length === 0) {
@@ -245,25 +272,95 @@ export async function scheduleTasks(jobId) {
     console.warn(`[scheduler]     Fix: add team members to the TEST project in PMS, then re-run`);
   }
 
-  // ── Step 5: Persist orchestrator assignments + dispatch to codegen ────────
-  console.log(`\n[scheduler] STEP 5 — Persisting assignments & dispatching to codegen queue`);
+  // ── Step 5: Compute scheduledDate / dueDate for each assignment ──────────
+  console.log(`\n[scheduler] STEP 5 — Computing daily schedule (max ${MAX_TASKS_PER_MEMBER_PER_DAY} tasks/member/day)`);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  // Track how many tasks each member has been given per working day
+  // memberDayLoad: memberId → Map<dateString, count>
+  const memberDayLoad = {};
+  for (const m of members) {
+    memberDayLoad[String(m._id)] = new Map();
+  }
+
+  // Track the latest finish date for each task (for dependency scheduling)
+  // taskFinishDay: task._id.toString() → Date (day the task is expected to finish)
+  const taskFinishDay = new Map();
+
+  for (const { task, member } of assignments) {
+    const memberId = String(member._id);
+    const dayLoad = memberDayLoad[memberId];
+    const hours = task.estimatedHours ?? 4;
+
+    // Earliest start = max(today, latest dependency finish day)
+    let earliest = new Date(today);
+    for (const depId of task.dependsOn ?? []) {
+      const depFinish = taskFinishDay.get(String(depId));
+      if (depFinish && depFinish > earliest) earliest = new Date(depFinish);
+    }
+
+    // Find the first working day from `earliest` where member has capacity
+    let scheduledDay = new Date(earliest);
+    while (true) {
+      const dow = scheduledDay.getDay();
+      if (dow !== 0 && dow !== 6) { // skip weekends
+        const key = scheduledDay.toISOString().slice(0, 10);
+        const count = dayLoad.get(key) ?? 0;
+        if (count < MAX_TASKS_PER_MEMBER_PER_DAY) {
+          dayLoad.set(key, count + 1);
+          break;
+        }
+      }
+      scheduledDay = new Date(scheduledDay);
+      scheduledDay.setDate(scheduledDay.getDate() + 1);
+    }
+
+    // Due date = scheduledDate + ceil(estimatedHours / 8) working days
+    const workDaysNeeded = Math.max(1, Math.ceil(hours / 8));
+    const dueDate = new Date(scheduledDay);
+    let added = 0;
+    while (added < workDaysNeeded) {
+      dueDate.setDate(dueDate.getDate() + 1);
+      if (dueDate.getDay() !== 0 && dueDate.getDay() !== 6) added++;
+    }
+
+    taskFinishDay.set(String(task._id), new Date(dueDate));
+    task._scheduledDate = scheduledDay;
+    task._dueDate = dueDate;
+
+    const isToday = isSameDay(scheduledDay, today);
+    console.log(`[scheduler]   [${task.pmsTaskId}] "${task.title.slice(0, 50)}"`);
+    console.log(`[scheduler]       → ${member.name} | scheduledDate=${scheduledDay.toISOString().slice(0,10)} | dueDate=${dueDate.toISOString().slice(0,10)} | dispatch=${isToday ? "TODAY" : "FUTURE"}`);
+  }
+
+  // ── Step 6: Persist orchestrator assignments + dispatch today's tasks ──────
+  console.log(`\n[scheduler] STEP 6 — Persisting assignments & dispatching today's tasks`);
   const queues = getQueues();
   const assignmentResults = [];
+  let dispatchedToday = 0;
+  let scheduledFuture = 0;
 
   // Process sequentially to maintain pmsCounts load-balancing across tasks
   for (let i = 0; i < assignments.length; i++) {
     const { task, member } = assignments[i];
-    const delay = i * staggerMs;
     const memberId = String(member._id);
+    const isToday = isSameDay(task._scheduledDate, today);
+    const delay = isToday ? i * staggerMs : 0; // stagger only today's dispatches
 
     // Persist in orchestrator DB
     await Task.findByIdAndUpdate(task._id, {
-      status: "queued",
+      status: isToday ? "queued" : "assigned",
       assignedTo: memberId,
+      scheduledDate: task._scheduledDate,
+      dueDate: task._dueDate,
     });
-    await OrchestratorUser.findByIdAndUpdate(memberId, {
-      $inc: { activeTaskCount: 1 },
-    });
+
+    if (isToday) {
+      await OrchestratorUser.findByIdAndUpdate(memberId, {
+        $inc: { activeTaskCount: 1 },
+      });
+    }
 
     // Sync assignee to PMS using the actual PMS project members
     let pmsAssignResult = "SKIPPED";
@@ -271,7 +368,11 @@ export async function scheduleTasks(jobId) {
       const pmsMember = pickPmsMember(task, pmsMembers, pmsCounts);
       if (pmsMember) {
         try {
-          await pmsClient.updateTask(task.pmsTaskId, { assignee: String(pmsMember._id) });
+          const pmsUpdate = {
+            assignee: String(pmsMember._id),
+            ...(task._dueDate ? { dueDate: task._dueDate.toISOString() } : {}),
+          };
+          await pmsClient.updateTask(task.pmsTaskId, pmsUpdate);
           pmsCounts[String(pmsMember._id)] = (pmsCounts[String(pmsMember._id)] ?? 0) + 1;
           pmsAssignResult = `SUCCESS → ${pmsMember.name} (${pmsMember._id}) capability=${pmsMember._capability}`;
           console.log(`[scheduler]   [${task.pmsTaskId}] PMS assignee set → ${pmsMember.name} ✓`);
@@ -282,12 +383,17 @@ export async function scheduleTasks(jobId) {
       }
     }
 
-    // Enqueue codegen
-    await queues.codegen.add(
-      "generate-code",
-      { jobId: String(orcJob._id), pmsTaskId: task.pmsTaskId },
-      { jobId: `codegen-${orcJob._id}-${task.pmsTaskId}`, delay },
-    );
+    if (isToday) {
+      // Dispatch to codegen now
+      await queues.codegen.add(
+        "generate-code",
+        { jobId: String(orcJob._id), pmsTaskId: task.pmsTaskId },
+        { jobId: `codegen-${orcJob._id}-${task.pmsTaskId}`, delay },
+      );
+      dispatchedToday++;
+    } else {
+      scheduledFuture++;
+    }
 
     assignmentResults.push({
       pmsTaskId: task.pmsTaskId,
@@ -295,8 +401,11 @@ export async function scheduleTasks(jobId) {
       priority: task.priority,
       assigneeName: member.name,
       assigneeEmail: member.email,
+      scheduledDate: task._scheduledDate.toISOString().slice(0, 10),
+      dueDate: task._dueDate.toISOString().slice(0, 10),
+      dispatchedToday: isToday,
       pmsAssignResult,
-      queueDelay: `${delay}ms`,
+      queueDelay: isToday ? `${delay}ms` : "not dispatched today",
     });
   }
 
@@ -321,10 +430,12 @@ export async function scheduleTasks(jobId) {
     console.log(`\n  ${name} — ${taskList.length} task(s):`);
     for (const r of taskList) {
       const pmsOk = r.pmsAssignResult.startsWith("SUCCESS");
+      const dispatchIcon = r.dispatchedToday ? "🚀 TODAY" : `📅 ${r.scheduledDate}`;
       console.log(`    [${r.pmsTaskId}] ${r.title}`);
-      console.log(`      Priority:   ${r.priority}`);
-      console.log(`      Queue delay: ${r.queueDelay}`);
-      console.log(`      PMS sync:   ${pmsOk ? "✓" : "⚠"} ${r.pmsAssignResult}`);
+      console.log(`      Priority:     ${r.priority}`);
+      console.log(`      Scheduled:    ${dispatchIcon} → due ${r.dueDate}`);
+      console.log(`      Queue delay:  ${r.queueDelay}`);
+      console.log(`      PMS sync:     ${pmsOk ? "✓" : "⚠"} ${r.pmsAssignResult}`);
     }
   }
 
@@ -334,7 +445,8 @@ export async function scheduleTasks(jobId) {
 
   console.log(`\n  TOTALS`);
   console.log(`  Total tasks assigned (orchestrator DB): ${assignments.length}`);
-  console.log(`  Total tasks dispatched to codegen:      ${assignments.length}`);
+  console.log(`  Dispatched to codegen today:            ${dispatchedToday}`);
+  console.log(`  Scheduled for future days:              ${scheduledFuture}`);
   console.log(`  PMS assignee sync — SUCCESS: ${pmsSuccessCount}  FAILED: ${pmsFailCount}  SKIPPED: ${pmsSkipCount}`);
 
   if (pmsSkipCount > 0) {
@@ -345,5 +457,5 @@ export async function scheduleTasks(jobId) {
 
   console.log(`${sep}\n`);
 
-  return { assigned: assignments.length, dispatched: assignments.length };
+  return { assigned: assignments.length, dispatched: dispatchedToday, scheduledFuture };
 }

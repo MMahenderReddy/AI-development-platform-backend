@@ -62,8 +62,11 @@ const processor = async (bullJob) => {
     console.log(`[task-assign-worker]   • [${t.pmsTaskId}] "${t.title}" | ${t.priority} | ${t.taskArea} | ${t.type}`);
   }
 
-  // ── Step 2: Show active team members ──────────────────────────────────────
-  const activeMembers = await OrchestratorUser.find({ status: "active" }).lean();
+  // ── Step 2: Show active team members for this workspace ──────────────────
+  const activeMembers = await OrchestratorUser.find({
+    status: "active",
+    pmsWorkspace: orcJob.pmsWorkspace ?? "core",
+  }).lean();
   console.log(`\n[task-assign-worker] STEP 2 — Active orchestrator team members: ${activeMembers.length}`);
   if (activeMembers.length === 0) {
     console.warn(`[task-assign-worker] ⚠ No active team members! Add members via the Team page.`);
@@ -104,9 +107,11 @@ const processor = async (bullJob) => {
   await bullJob.updateProgress(90);
 
   // ── Step 5: Final status ──────────────────────────────────────────────────
-  if (result.dispatched > 0) {
+  const totalScheduled = (result.assigned ?? 0);
+  if (totalScheduled > 0) {
+    // Some tasks may be dispatched today, others scheduled for future days — job is generating
     await Job.findByIdAndUpdate(jobId, { status: "generating", stage: 6 });
-    console.log(`[task-assign-worker] ✓ Job → generating (stage 6): ${result.dispatched} task(s) queued for codegen`);
+    console.log(`[task-assign-worker] ✓ Job → generating (stage 6): ${result.dispatched} dispatched today, ${result.scheduledFuture ?? 0} scheduled for future days`);
   } else {
     await Job.findByIdAndUpdate(jobId, {
       status: "awaiting_assignment",
@@ -114,13 +119,13 @@ const processor = async (bullJob) => {
         "Auto-assignment found no active team members. " +
         'Add members in the Team page, then use "Start Code Generation" manually.',
     });
-    console.warn(`[task-assign-worker] ⚠ No tasks dispatched — job → awaiting_assignment`);
+    console.warn(`[task-assign-worker] ⚠ No tasks assigned — job → awaiting_assignment`);
     console.warn(`[task-assign-worker]   Cause: either no active orchestrator users or no pending tasks`);
   }
 
   audit("system", "tasks.assigned", {
     jobId: orcJob._id,
-    details: { assigned: result.assigned, dispatched: result.dispatched },
+    details: { assigned: result.assigned, dispatched: result.dispatched, scheduledFuture: result.scheduledFuture ?? 0 },
   });
 
   // ── Final workflow summary ────────────────────────────────────────────────
@@ -173,7 +178,8 @@ const processor = async (bullJob) => {
   console.log(`  Unassigned Tasks:         ${unassigned.length}`);
   console.log(`  Tasks With Hours Estimate: ${withDue.length}`);
   console.log(`  Tasks Without Est.:        ${allTasks.length - withDue.length}`);
-  console.log(`  Dispatched to Codegen:    ${result.dispatched}`);
+  console.log(`  Dispatched Today:          ${result.dispatched}`);
+  console.log(`  Scheduled Future Days:     ${result.scheduledFuture ?? 0}`);
   console.log(`${"=".repeat(50)}\n`);
 
   await bullJob.updateProgress(100);

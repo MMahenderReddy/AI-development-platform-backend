@@ -33,12 +33,13 @@ router.get("/", requireAuth, requireRole("admin", "manager"), async (req, res, n
 // ── Invite (create) a new member ──────────────────────────────────────────────
 router.post("/invite", requireAuth, requireRole("admin"), async (req, res, next) => {
   try {
-    const { name, email, password, role, capability, pmsUserId, skills } = req.body ?? {};
+    const { name, email, password, role, capability, pmsUserId, skills, pmsWorkspace } = req.body ?? {};
     if (!name?.trim()) throw badRequest("Name is required");
     if (!email?.trim()) throw badRequest("Email is required");
     if (!password || password.length < 8) throw badRequest("Password must be at least 8 characters");
     if (role && !ROLES.includes(role)) throw badRequest(`Role must be one of: ${ROLES.join(", ")}`);
     if (capability && !CAPABILITIES.includes(capability)) throw badRequest(`Capability must be one of: ${CAPABILITIES.join(", ")}`);
+    if (pmsWorkspace && !["core", "consultants"].includes(pmsWorkspace)) throw badRequest("pmsWorkspace must be 'core' or 'consultants'");
 
     const existing = await OrchestratorUser.findOne({ email: String(email).toLowerCase() });
     if (existing) throw badRequest("A user with that email already exists");
@@ -55,6 +56,7 @@ router.post("/invite", requireAuth, requireRole("admin"), async (req, res, next)
       role: role ?? "viewer",
       capability: capability ?? "fullstack",
       pmsUserId: pmsUserId ?? "",
+      pmsWorkspace: pmsWorkspace ?? "core",
       skills: skillsArr,
       status: "active",
     });
@@ -70,6 +72,7 @@ router.post("/invite", requireAuth, requireRole("admin"), async (req, res, next)
       role: user.role,
       capability: user.capability,
       pmsUserId: user.pmsUserId,
+      pmsWorkspace: user.pmsWorkspace,
       skills: user.skills,
       status: user.status,
       createdAt: user.createdAt,
@@ -153,6 +156,52 @@ router.patch("/:id/skills", requireAuth, async (req, res, next) => {
 
     audit(req.user, "users.skills_updated", {
       details: { targetEmail: user.email, skills },
+    });
+
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Update pmsUserId (link orchestrator user to PMS account) ─────────────────
+router.patch("/:id/pms-user", requireAuth, requireRole("admin"), async (req, res, next) => {
+  try {
+    const { pmsUserId } = req.body ?? {};
+    if (!pmsUserId || typeof pmsUserId !== "string") throw badRequest("pmsUserId is required");
+
+    const user = await OrchestratorUser.findByIdAndUpdate(
+      req.params.id,
+      { pmsUserId: String(pmsUserId).trim() },
+      { new: true, select: "-passwordHash" }
+    );
+    if (!user) throw notFound("User");
+
+    audit(req.user, "users.pms_linked", {
+      details: { targetEmail: user.email, pmsUserId: user.pmsUserId },
+    });
+
+    res.json(user);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ── Update pmsWorkspace (switch user between core / consultants) ──────────────
+router.patch("/:id/workspace", requireAuth, requireRole("admin"), async (req, res, next) => {
+  try {
+    const { pmsWorkspace } = req.body ?? {};
+    if (!["core", "consultants"].includes(pmsWorkspace)) throw badRequest("pmsWorkspace must be 'core' or 'consultants'");
+
+    const user = await OrchestratorUser.findByIdAndUpdate(
+      req.params.id,
+      { pmsWorkspace },
+      { new: true, select: "-passwordHash" }
+    );
+    if (!user) throw notFound("User");
+
+    audit(req.user, "users.workspace_changed", {
+      details: { targetEmail: user.email, pmsWorkspace },
     });
 
     res.json(user);

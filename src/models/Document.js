@@ -26,6 +26,9 @@ const docSchema = new Schema(
     chunked: { type: Boolean, default: false },
     requirements: [requirementSchema],
     uploadedBy: { type: Schema.Types.ObjectId, ref: "OrchestratorUser" },
+    // version history — links to the document this one was compared against
+    previousDocumentId: { type: Schema.Types.ObjectId, ref: "Document", default: undefined },
+    documentVersion:    { type: Number, default: 1 },
   },
   { timestamps: true },
 );

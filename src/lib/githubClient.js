@@ -107,6 +107,57 @@ const enc = encodeURIComponent;
 
 // ── Public API ───────────────────────────────────────────────────────────────
 
+/**
+ * Build a GitHub API client that uses a member's user OAuth token instead of
+ * the shared GitHub App installation token. Used by push.worker.js to open
+ * PRs as the assigned member's GitHub identity.
+ */
+export function githubUserClient(userAccessToken) {
+  const userRequest = async (method, path, body) => {
+    const res = await fetch(`https://api.github.com${path}`, {
+      method,
+      headers: {
+        Authorization: `Bearer ${userAccessToken}`,
+        Accept: "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      const err = new Error(data.message ?? `GitHub API error ${res.status}`);
+      err.status = res.status;
+      throw err;
+    }
+    return res.status === 204 ? {} : res.json();
+  };
+
+  return {
+    createPull: (fullName, { branch, base, title, body }) =>
+      userRequest("POST", `/repos/${fullName}/pulls`, { title, head: branch, base, body }).then((p) => ({
+        number: p.number,
+        htmlUrl: p.html_url,
+        title: p.title,
+      })),
+
+    requestReviewers: (fullName, prNumber, reviewers) =>
+      userRequest("POST", `/repos/${fullName}/pulls/${prNumber}/requested_reviewers`, { reviewers }).catch((err) => {
+        console.warn(`[github-user-client] requestReviewers failed for PR #${prNumber}: ${err.message}`);
+        return null;
+      }),
+
+    findPullByBranch: async (fullName, branch) => {
+      const [owner] = fullName.split("/");
+      const enc = encodeURIComponent;
+      const list = await userRequest("GET", `/repos/${fullName}/pulls?state=open&head=${enc(owner)}:${enc(branch)}&per_page=5`);
+      if (!Array.isArray(list) || list.length === 0) return null;
+      const p = list[0];
+      return { number: p.number, htmlUrl: p.html_url };
+    },
+  };
+}
+
 export const githubClient = {
   isConfigured: () => config.github.isConfigured(),
 
@@ -157,6 +208,14 @@ export const githubClient = {
       htmlUrl: p.html_url,
       title: p.title,
     })),
+
+  /** Request reviewers on a pull request. reviewers = array of GitHub logins. */
+  requestReviewers: (fullName, prNumber, reviewers) =>
+    ghRequest("POST", `/repos/${fullName}/pulls/${prNumber}/requested_reviewers`, { reviewers }).catch((err) => {
+      // Non-fatal — PR is open even if reviewer request fails
+      console.warn(`[github] requestReviewers failed for PR #${prNumber}: ${err.message}`);
+      return null;
+    }),
 
   /**
    * Find the first open PR whose head matches the given branch.
@@ -220,6 +279,39 @@ export const githubClient = {
       runs: runs.map((r) => ({ name: r.name, status: r.status, conclusion: r.conclusion })),
     };
   },
+
+  /**
+   * Get the unified diff of a pull request (raw patch text).
+   * Truncated to maxChars to stay within AI context limits.
+   */
+  getPullDiff: async (fullName, number, maxChars = 24_000) => {
+    const token = await getToken();
+    const res = await fetch(`https://api.github.com/repos/${fullName}/pulls/${number}`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github.diff",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`getPullDiff failed (${res.status}): ${text.slice(0, 200)}`);
+    }
+    const diff = await res.text();
+    return diff.length > maxChars ? diff.slice(0, maxChars) + "\n\n[diff truncated]" : diff;
+  },
+
+  /**
+   * Post a review on a pull request.
+   * event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT"
+   * Returns the created review object.
+   */
+  createReview: (fullName, number, { event, body }) =>
+    ghRequest("POST", `/repos/${fullName}/pulls/${number}/reviews`, { event, body }).then((r) => ({
+      id: r.id,
+      state: r.state,
+      submittedAt: r.submitted_at,
+    })),
 
   /**
    * Merge a pull request.

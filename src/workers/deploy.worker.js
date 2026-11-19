@@ -19,10 +19,27 @@ import { connectDb } from "../lib/db.js";
 import Job from "../models/Job.js";
 import Task from "../models/Task.js";
 import Project from "../models/Project.js";
-import { pmsClient } from "../lib/pmsClient.js";
+import { pmsClientFor } from "../lib/pmsClient.js";
 import { audit } from "../lib/audit.js";
 
 await connectDb();
+
+/** PMS state machine: todo → in_progress → in_review → done (3 hops) */
+async function advanceTosDone(pmsClient, taskId, note) {
+  const intermediates = ["in_progress", "in_review"];
+  const isRuleError = (e) => e.message?.includes("can only move to") || e.status === 422;
+  try {
+    await pmsClient.moveTask(taskId, "done", note);
+    return;
+  } catch (e) {
+    if (!isRuleError(e)) throw e;
+  }
+  for (const step of intermediates) {
+    try { await pmsClient.moveTask(taskId, step, note); } catch (e) { if (!isRuleError(e)) throw e; }
+    try { await pmsClient.moveTask(taskId, "done", note); return; } catch (e) { if (!isRuleError(e)) throw e; }
+  }
+  throw new Error(`PMS task ${taskId}: unable to reach "done" via any transition path`);
+}
 
 const HEALTH_POLL_INTERVAL_MS = 10_000;
 const HEALTH_POLL_MAX_ATTEMPTS = 30; // 5 minutes total
@@ -31,7 +48,7 @@ async function triggerDeployment(webhookUrl) {
   const res = await fetch(webhookUrl, {
     method: "POST",
     headers: { "Content-Type": "application/json", "User-Agent": "AI-Orchestrator/1.0" },
-    body: JSON.stringify({ event: "deploy", triggeredBy: "AI Orchestrator" }),
+    body: JSON.stringify({ event: "deploy", triggeredBy: "orchestrator" }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -127,10 +144,14 @@ async function markTasksDone(orcJob) {
 
   // Update PMS tasks to done
   try {
+    const pmsClient = pmsClientFor(orcJob.pmsWorkspace ?? "core");
     await pmsClient.ensureSession();
+    const deployedNote = `Deployed on ${new Date().toISOString()}`;
     for (const task of tasks) {
       if (task.pmsTaskId) {
-        await pmsClient.moveTask(task.pmsTaskId, "done").catch(() => {});
+        await advanceTosDone(pmsClient, task.pmsTaskId, deployedNote).catch((e) =>
+          console.warn(`[deploy-worker] could not move task ${task.pmsTaskId} to done:`, e.message),
+        );
       }
     }
   } catch (err) {
